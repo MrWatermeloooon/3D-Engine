@@ -1,0 +1,16 @@
+{
+  "name": "vulkan-engine",
+  "version": "0.1.0",
+  "dependencies": [
+    "glfw3",
+    "glm",
+    "stb",
+    "tinyobjloader",
+    "entt",
+    {
+      "name": "imgui",
+      "features": ["glfw-binding", "vulkan-binding", "docking-experimental"]
+    },
+    "imguizmo"
+  ]
+}

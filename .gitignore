@@ -1,0 +1,10 @@
+build/
+.vs/
+*.spv
+*.user
+*.suo
+.cache/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+VulkanSDK-Installer.exe
