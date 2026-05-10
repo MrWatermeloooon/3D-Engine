@@ -129,3 +129,58 @@ The repository intentionally ignores local build output, Visual Studio metadata,
 - LOD system: swap to lower-poly meshes at distance to keep far objects cheap.
 - Occlusion culling: skip objects hidden behind other geometry.
 - Variable rate shading: shade detailed edges at full rate and flat areas more cheaply.
+
+## Hard Addons
+
+These are larger, more advanced systems that would push the engine toward professional game engine territory. Many of them are multi-month or multi-year projects on their own.
+
+### Simulation
+
+Nature, destruction, and complex geometry systems.
+
+- Atmospheric scattering: physically accurate sky rendering for sunrise, sunset, and blue-sky lighting generated from math.
+- Ocean / water: FFT wave simulation for realistic open water with foam and waves.
+- Cloth simulation: position-based dynamics for capes, flags, and fabric that reacts to physics.
+- Hair / fur: strand-based rendering for thousands of individual simulated strands.
+- Subsurface scattering: light passing through skin, wax, marble, and other organic or translucent surfaces.
+- Terrain system: heightmaps, tessellation, clipmap LOD, and splat-map texturing.
+- Foliage system: grass, trees, wind animation, GPU instancing, and LOD.
+- Destruction: real-time mesh fracture with Voronoi shatter and debris simulation.
+
+### AI / Animation
+
+Systems that make the world feel alive.
+
+- NavMesh pathfinding: Recast/Detour integration so AI agents can navigate the world.
+- Behavior trees: AI decision making for patrol, chase, attack, flee, and other logic.
+- Animation state machine: blend trees, transition conditions, and layered animations.
+- Inverse kinematics: FABRIK IK for feet planting on uneven ground and hands reaching for objects.
+- Ragdoll physics: blend from animation to physics for fully dynamic bodies.
+
+### Tools
+
+Developer tools that make the engine faster and more professional to build with.
+
+- Flame graph profiler: visual CPU timeline for finding frame-time bottlenecks.
+- GPU timeline profiler: timestamp queries for profiling every render pass on the GPU.
+- Dev console: in-engine command line for tweaking CVars, spawning objects, and running scripts.
+- Cinematic sequencer: timeline editor for keyframing cameras, lights, and transforms.
+- Build / packaging: standalone executable shipping with asset packing and editor-code stripping.
+
+### Platform
+
+Work that takes the engine beyond a single Windows desktop build.
+
+- Linux support: CMake-based build and path fixes for cross-platform support.
+- VR / OpenXR: stereo rendering, head tracking, and controller input through the OpenXR standard.
+- Networking: ENet or custom UDP with authoritative server logic and client prediction.
+- Plugin system: runtime DLL loading so the engine can be extended without recompiling.
+
+### Moonshots
+
+Unreal-level systems that are years of work each, but incredible long-term goals.
+
+- Virtual geometry: Nanite-style streaming and rendering of massive triangle counts through mesh shaders.
+- Dynamic GI: Lumen-style fully dynamic indirect lighting with no baked lightmaps.
+- Full path tracer: reference-quality rendering where light transport is physically simulated.
+- Virtual texturing: stream texture tiles on demand for huge texture detail with controlled memory use.
