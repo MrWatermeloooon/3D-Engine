@@ -9,6 +9,8 @@ layout(location = 1) in vec2 vTexCoord;
 layout(location = 2) in vec3 vNormal;
 layout(location = 3) in vec3 vWorldPos;
 layout(location = 4) in vec3 vViewPos;
+layout(location = 5) flat in vec4 vColorTint;
+layout(location = 6) flat in vec4 vMatParams;
 
 layout(set = 0, binding = 0) uniform SceneUBO {
     mat4 view;
@@ -38,12 +40,6 @@ layout(set = 0, binding = 2) uniform CascadeUBO {
 
 layout(set = 0, binding = 3) uniform sampler2DArrayShadow shadowMap;
 layout(set = 1, binding = 0) uniform sampler2D albedoTex;
-
-layout(push_constant) uniform PushConstants {
-    layout(offset = 64) vec4  colorTint;
-    layout(offset = 80) float metallic;
-    layout(offset = 84) float roughness;
-} push;
 
 layout(location = 0) out vec4 outColor;
 
@@ -175,9 +171,9 @@ vec3 evaluateLight(Light L, vec3 N, vec3 V, vec3 worldPos, vec3 albedo, vec3 F0,
 
 void main() {
     vec3 albedoSample = texture(albedoTex, vTexCoord).rgb;
-    vec3 albedo       = albedoSample * vColor * push.colorTint.rgb;
-    float metallic    = push.metallic;
-    float roughness   = clamp(push.roughness, 0.04, 1.0);
+    vec3 albedo       = albedoSample * vColor * vColorTint.rgb;
+    float metallic    = vMatParams.x;
+    float roughness   = clamp(vMatParams.y, 0.04, 1.0);
 
     vec3 N = normalize(vNormal);
     vec3 V = normalize(scene.cameraPos.xyz - vWorldPos);

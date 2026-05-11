@@ -16,6 +16,8 @@
 #include "lights.h"
 #include "shadow.h"
 #include "postfx.h"
+#include "instancing.h"
+#include "skeletal.h"
 
 class Engine {
 public:
@@ -25,6 +27,8 @@ public:
 
     ShadowData&     shadow()   { return m_shadow; }
     PostFXSettings& postFX()   { return m_postFXSettings; }
+    int  visibleEntities() const { return m_visibleEntities; }
+    int  totalEntities()   const { return m_totalEntities; }
 
 private:
     void recreateSwapchain();
@@ -43,16 +47,30 @@ private:
     DebugUI          m_debugUI;
     LightBufferData  m_lightBuffers;
     ShadowData       m_shadow;
+    InstanceBuffer   m_instances;
+
+    // Skeletal animation
+    SkinnedMesh                  m_skinnedMesh;
+    PipelineData                 m_skinnedPipeline;
+    VkDescriptorSetLayout        m_boneSetLayout = VK_NULL_HANDLE;
+    std::vector<AllocatedBuffer> m_boneUbos;
+    std::vector<void*>           m_boneMapped;
+    std::vector<VkDescriptorSet> m_boneDescSets;
 
     // Post-FX
     OffscreenTarget  m_offscreen;
     BloomChain       m_bloom;
     SSAOTarget       m_ssao;
     CompositeData    m_composite;
+    LdrTarget        m_ldr;
     PostFXPipelines  m_postFX;
     PostFXSettings   m_postFXSettings{};
 
     VkFormat         m_depthFormat = VK_FORMAT_UNDEFINED;
+
+    // Per-frame stats
+    int    m_visibleEntities = 0;
+    int    m_totalEntities   = 0;
 
     double m_lastFrameTime = 0.0;
     double m_lastMouseX    = 0.0;

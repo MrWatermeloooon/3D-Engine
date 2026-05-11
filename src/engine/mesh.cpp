@@ -80,6 +80,15 @@ Mesh loadMeshFromObj(const std::string& filepath) {
         }
     }
 
+    // Compute local AABB
+    if (!mesh.vertices.empty()) {
+        mesh.aabbMin = mesh.aabbMax = mesh.vertices[0].position;
+        for (const auto& v : mesh.vertices) {
+            mesh.aabbMin = glm::min(mesh.aabbMin, v.position);
+            mesh.aabbMax = glm::max(mesh.aabbMax, v.position);
+        }
+    }
+
     std::cout << "[VulkanEngine] Loaded mesh: " << mesh.vertices.size() << " vertices, "
               << mesh.indices.size() / 3 << " triangles"
               << (attrib.normals.empty() ? " (computed normals)" : "") << "\n";
@@ -130,6 +139,9 @@ Mesh createCubeMesh() {
         16, 17, 18, 18, 19, 16,
         20, 21, 22, 22, 23, 20,
     };
+
+    mesh.aabbMin = { -0.5f, -0.5f, -0.5f };
+    mesh.aabbMax = {  0.5f,  0.5f,  0.5f };
 
     return mesh;
 }

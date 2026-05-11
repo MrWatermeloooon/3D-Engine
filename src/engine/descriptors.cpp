@@ -80,8 +80,8 @@ void createUniformBuffers(DescriptorData& data, VkPhysicalDevice physicalDevice,
 void createDescriptorPool(DescriptorData& data, VkDevice device,
                           uint32_t framesInFlight, uint32_t maxMaterials) {
     VkDescriptorPoolSize poolSizes[] = {
-        // Scene UBO + lights UBO + cascade UBO per frame
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         framesInFlight * 3 },
+        // Scene UBO + lights UBO + cascade UBO + bone UBO per frame
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         framesInFlight * 4 },
         // Shadow map per frame (one per scene set), plus per-material textures
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, framesInFlight + maxMaterials },
     };
@@ -91,7 +91,7 @@ void createDescriptorPool(DescriptorData& data, VkDevice device,
     poolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     poolInfo.poolSizeCount = 2;
     poolInfo.pPoolSizes    = poolSizes;
-    poolInfo.maxSets       = framesInFlight + maxMaterials;
+    poolInfo.maxSets       = framesInFlight + maxMaterials + framesInFlight /*bones*/;
 
     VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, nullptr, &data.descriptorPool));
 }

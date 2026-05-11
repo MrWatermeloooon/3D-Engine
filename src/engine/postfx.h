@@ -72,6 +72,19 @@ struct CompositeData {
     std::vector<VkDescriptorSet> descriptorSets;
 };
 
+// ── LDR target (output of composite, input to FXAA) ─────────────────────────
+
+struct LdrTarget {
+    AllocatedImage image;
+    VkImageView    view        = VK_NULL_HANDLE;
+    VkRenderPass   renderPass  = VK_NULL_HANDLE;
+    VkFramebuffer  framebuffer = VK_NULL_HANDLE;
+    VkSampler      sampler     = VK_NULL_HANDLE;
+    VkExtent2D     extent{};
+    VkFormat       format      = VK_FORMAT_R8G8B8A8_UNORM;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE; // used by FXAA pass
+};
+
 // ── Settings (UI-driven) ────────────────────────────────────────────────────
 
 struct PostFXSettings {
@@ -100,6 +113,9 @@ struct PostFXSettings {
     float vignetteIntensity = 0.6f;
     float vignetteFalloff   = 0.15f;
 
+    // FXAA
+    bool  fxaaEnabled = true;
+
     // Debug
     int   debugView = 0; // 0=final, 1=HDR, 2=Bloom, 3=SSAO, 5=Lit (no postfx)
 };
@@ -117,9 +133,13 @@ struct PostFXPipelines {
     VkPipelineLayout compositeLayout = VK_NULL_HANDLE;
     VkPipeline       composite       = VK_NULL_HANDLE;
 
-    VkDescriptorSetLayout bloomSetLayout    = VK_NULL_HANDLE;
-    VkDescriptorSetLayout ssaoSetLayout     = VK_NULL_HANDLE;
+    VkPipelineLayout fxaaLayout = VK_NULL_HANDLE;
+    VkPipeline       fxaa       = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout bloomSetLayout     = VK_NULL_HANDLE;
+    VkDescriptorSetLayout ssaoSetLayout      = VK_NULL_HANDLE;
     VkDescriptorSetLayout compositeSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout fxaaSetLayout      = VK_NULL_HANDLE;
 
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 };
@@ -143,8 +163,12 @@ void createCompositeData(CompositeData& c, VkPhysicalDevice physicalDevice, VkDe
                          uint32_t framesInFlight);
 void destroyCompositeData(VkDevice device, CompositeData& c);
 
+void createLdrTarget(LdrTarget& t, VkPhysicalDevice physicalDevice, VkDevice device,
+                     VkExtent2D extent);
+void destroyLdrTarget(VkDevice device, LdrTarget& t);
+
 void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloom,
-                           SSAOTarget& ssao, CompositeData& composite,
+                           SSAOTarget& ssao, CompositeData& composite, LdrTarget& ldr,
                            OffscreenTarget& offscreen, VkRenderPass swapchainPass,
                            uint32_t framesInFlight);
 void destroyPostFXPipelines(VkDevice device, PostFXPipelines& p);

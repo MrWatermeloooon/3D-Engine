@@ -478,6 +478,48 @@ void destroyCompositeData(VkDevice device, CompositeData& c) {
     c.uboMapped.clear();
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// LDR target (composite writes here; FXAA reads from here)
+// ──────────────────────────────────────────────────────────────────────────
+
+void createLdrTarget(LdrTarget& t, VkPhysicalDevice physicalDevice, VkDevice device,
+                     VkExtent2D extent)
+{
+    t.extent = extent;
+    t.image = createImage(physicalDevice, device, extent.width, extent.height, 1,
+        t.format, VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    t.view = createImageView(device, t.image.image, t.format, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+
+    t.renderPass = makeColorOnlyPass(device, t.format, VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                                     VK_IMAGE_LAYOUT_UNDEFINED);
+
+    VkFramebufferCreateInfo fb{};
+    fb.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fb.renderPass      = t.renderPass;
+    fb.attachmentCount = 1;
+    fb.pAttachments    = &t.view;
+    fb.width           = extent.width;
+    fb.height          = extent.height;
+    fb.layers          = 1;
+    VK_CHECK(vkCreateFramebuffer(device, &fb, nullptr, &t.framebuffer));
+
+    t.sampler = makeLinearClampSampler(device);
+}
+
+void destroyLdrTarget(VkDevice device, LdrTarget& t) {
+    if (t.sampler)     vkDestroySampler(device, t.sampler, nullptr);
+    if (t.framebuffer) vkDestroyFramebuffer(device, t.framebuffer, nullptr);
+    if (t.renderPass)  vkDestroyRenderPass(device, t.renderPass, nullptr);
+    if (t.view)        vkDestroyImageView(device, t.view, nullptr);
+    if (t.image.image) {
+        vkDestroyImage(device, t.image.image, nullptr);
+        vkFreeMemory(device, t.image.memory, nullptr);
+    }
+    t = {};
+}
+
 void updateCompositeUbo(CompositeData& c, uint32_t frameIndex, const PostFXSettings& s) {
     CompositeUboCpu u{};
     u.exposure          = s.exposure;
@@ -654,20 +696,16 @@ static VkPipeline makeFullscreenPipeline(VkDevice device, VkRenderPass renderPas
 }
 
 void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloom,
-                           SSAOTarget& ssao, CompositeData& composite,
+                           SSAOTarget& ssao, CompositeData& composite, LdrTarget& ldr,
                            OffscreenTarget& offscreen, VkRenderPass swapchainPass,
                            uint32_t framesInFlight)
 {
-    // ── Descriptor pool ─────────────────────────────────────────────────
-    // Bloom: BLOOM_MIP_COUNT downsample sets + BLOOM_MIP_COUNT upsample sets, each with 1 sampler.
-    // SSAO: 1 set with 2 samplers + 1 UBO.
-    // Composite: 1 set with 3 samplers + 1 UBO.
     uint32_t bloomSets    = BLOOM_MIP_COUNT * 2;
-    uint32_t totalSets    = bloomSets + framesInFlight /*ssao*/ + framesInFlight /*composite*/;
+    uint32_t totalSets    = bloomSets + framesInFlight /*ssao*/ + framesInFlight /*composite*/ + 1 /*fxaa*/;
 
     VkDescriptorPoolSize sizes[] = {
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-          bloomSets + framesInFlight * 2 /*ssao depth+noise*/ + framesInFlight * 3 /*comp hdr+bloom+ssao*/ },
+          bloomSets + framesInFlight * 2 /*ssao*/ + framesInFlight * 3 /*comp*/ + 1 /*fxaa*/ },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         framesInFlight + framesInFlight },
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -748,8 +786,34 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
         lci3.pSetLayouts            = &p.compositeSetLayout;
         VK_CHECK(vkCreatePipelineLayout(device, &lci3, nullptr, &p.compositeLayout));
     }
-    p.composite = makeFullscreenPipeline(device, swapchainPass, p.compositeLayout,
+    // Composite targets the LDR render pass (not the swapchain directly anymore)
+    p.composite = makeFullscreenPipeline(device, ldr.renderPass, p.compositeLayout,
                                          "shaders/composite.frag.spv");
+
+    // ── FXAA: 1 set with 1 sampler (LDR input) ──────────────────────────
+    {
+        VkDescriptorSetLayoutBinding b{};
+        b.binding = 0; b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        p.fxaaSetLayout = makeDescriptorSetLayout(device, { b });
+    }
+    {
+        // Push constant: vec4 (texelSize.xy, enable, _)
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        pcr.offset     = 0;
+        pcr.size       = sizeof(glm::vec4);
+
+        VkPipelineLayoutCreateInfo lci{};
+        lci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        lci.setLayoutCount         = 1;
+        lci.pSetLayouts            = &p.fxaaSetLayout;
+        lci.pushConstantRangeCount = 1;
+        lci.pPushConstantRanges    = &pcr;
+        VK_CHECK(vkCreatePipelineLayout(device, &lci, nullptr, &p.fxaaLayout));
+    }
+    p.fxaa = makeFullscreenPipeline(device, swapchainPass, p.fxaaLayout,
+                                    "shaders/fxaa.frag.spv");
 
     // ── Allocate descriptor sets ────────────────────────────────────────
     auto allocSet = [&](VkDescriptorSetLayout layout) {
@@ -823,6 +887,21 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
         vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
     }
 
+    // FXAA descriptor set (reads from LDR target)
+    {
+        ldr.descriptorSet = allocSet(p.fxaaSetLayout);
+        VkDescriptorImageInfo info{};
+        info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        info.imageView   = ldr.view;
+        info.sampler     = ldr.sampler;
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = ldr.descriptorSet; w.dstBinding = 0;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.descriptorCount = 1; w.pImageInfo = &info;
+        vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
+    }
+
     // Composite sets (per-frame UBO)
     composite.descriptorSets.resize(framesInFlight);
     for (uint32_t f = 0; f < framesInFlight; ++f) {
@@ -863,6 +942,9 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
 }
 
 void destroyPostFXPipelines(VkDevice device, PostFXPipelines& p) {
+    if (p.fxaa)              vkDestroyPipeline(device, p.fxaa, nullptr);
+    if (p.fxaaLayout)        vkDestroyPipelineLayout(device, p.fxaaLayout, nullptr);
+    if (p.fxaaSetLayout)     vkDestroyDescriptorSetLayout(device, p.fxaaSetLayout, nullptr);
     if (p.composite)         vkDestroyPipeline(device, p.composite, nullptr);
     if (p.compositeLayout)   vkDestroyPipelineLayout(device, p.compositeLayout, nullptr);
     if (p.compositeSetLayout)vkDestroyDescriptorSetLayout(device, p.compositeSetLayout, nullptr);

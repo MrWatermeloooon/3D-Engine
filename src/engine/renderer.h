@@ -11,6 +11,9 @@
 #include "descriptors.h"
 #include "shadow.h"
 #include "postfx.h"
+#include "frustum.h"
+#include "instancing.h"
+#include "skeletal.h"
 
 class ResourceManager;
 
@@ -35,11 +38,24 @@ struct DrawFrameInfo {
     BloomChain*      bloom;
     SSAOTarget*      ssao;
     CompositeData*   composite;
+    LdrTarget*       ldr;
     PostFXPipelines* postfx;
     PostFXSettings*  settings;
 
     UniformBufferObject* ubo;
     CascadeUBO*          cascadeUbo;
+    Frustum*             cameraFrustum;
+    InstanceBuffer*      instances;
+
+    // Skeletal animation
+    SkinnedMesh*         skinnedMesh        = nullptr;
+    VkPipeline           skinnedPipeline    = VK_NULL_HANDLE;
+    VkPipelineLayout     skinnedLayout      = VK_NULL_HANDLE;
+    VkDescriptorSet      boneDescriptorSet  = VK_NULL_HANDLE;
+
+    // Per-frame stats (written by drawFrame, read by UI)
+    int* visibleEntities = nullptr;
+    int* totalEntities   = nullptr;
 
     entt::registry*  registry;
     ResourceManager* resources;

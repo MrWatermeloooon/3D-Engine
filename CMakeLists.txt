@@ -35,6 +35,9 @@ set(SOURCES
     src/engine/lights.cpp
     src/engine/shadow.cpp
     src/engine/postfx.cpp
+    src/engine/frustum.cpp
+    src/engine/instancing.cpp
+    src/engine/skeletal.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
@@ -71,6 +74,8 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/bloom_downsample.frag
     ${SHADER_SOURCE_DIR}/bloom_upsample.frag
     ${SHADER_SOURCE_DIR}/ssao.frag
+    ${SHADER_SOURCE_DIR}/fxaa.frag
+    ${SHADER_SOURCE_DIR}/mesh_skinned.vert
 )
 
 set(SHADER_OUTPUTS "")

@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "frustum.h"
 
 #include <imgui.h>
 
@@ -51,14 +52,19 @@ void Engine::init() {
                m_renderer.commandPool, m_vk.graphicsQueue,
                m_swapchain.extent, MAX_FRAMES_IN_FLIGHT);
 
-    // Composite
+    // Composite + LDR (composite writes here, FXAA reads from here)
     createCompositeData(m_composite, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
+    createLdrTarget(m_ldr, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
 
     // Shadow
     createShadowResources(m_shadow, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
 
     // Light buffers
     createLightBuffers(m_lightBuffers, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
+
+    // Instance buffer (capacity 16384 instances per frame — covers 10k+ objects)
+    createInstanceBuffer(m_instances, m_vk.physicalDevice, m_vk.device,
+                         MAX_FRAMES_IN_FLIGHT, 16384);
 
     // Descriptor set layouts (scene + material)
     m_descriptors.sceneSetLayout    = createSceneSetLayout(m_vk.device);
@@ -91,8 +97,64 @@ void Engine::init() {
     m_shadowPipeline = createShadowPipeline(m_vk.device, m_shadow.renderPass,
                                             SHADOW_MAP_SIZE, "shaders/shadow.vert.spv");
 
+    // ── Skeletal animation setup ────────────────────────────────────────
+    m_skinnedMesh = createTestBoneChain();
+    uploadSkinnedMesh(m_skinnedMesh, m_vk.physicalDevice, m_vk.device,
+                      m_renderer.commandPool, m_vk.graphicsQueue);
+
+    // Bone palette descriptor set layout (set 2, binding 0, UBO)
+    {
+        VkDescriptorSetLayoutBinding b{};
+        b.binding = 0;
+        b.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        b.descriptorCount = 1;
+        b.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        VkDescriptorSetLayoutCreateInfo li{};
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 1; li.pBindings = &b;
+        vkCreateDescriptorSetLayout(m_vk.device, &li, nullptr, &m_boneSetLayout);
+    }
+
+    // Per-frame bone palette UBOs + descriptor sets
+    m_boneUbos.resize(MAX_FRAMES_IN_FLIGHT);
+    m_boneMapped.resize(MAX_FRAMES_IN_FLIGHT);
+    m_boneDescSets.resize(MAX_FRAMES_IN_FLIGHT);
+    for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        m_boneUbos[i] = createBuffer(m_vk.physicalDevice, m_vk.device, sizeof(BonePalette),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkMapMemory(m_vk.device, m_boneUbos[i].memory, 0, sizeof(BonePalette), 0,
+                    &m_boneMapped[i]);
+    }
+    {
+        std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, m_boneSetLayout);
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = m_descriptors.descriptorPool;
+        ai.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+        ai.pSetLayouts = layouts.data();
+        vkAllocateDescriptorSets(m_vk.device, &ai, m_boneDescSets.data());
+
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+            VkDescriptorBufferInfo bi{};
+            bi.buffer = m_boneUbos[i].buffer;
+            bi.range  = sizeof(BonePalette);
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = m_boneDescSets[i]; w.dstBinding = 0;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            w.descriptorCount = 1; w.pBufferInfo = &bi;
+            vkUpdateDescriptorSets(m_vk.device, 1, &w, 0, nullptr);
+        }
+    }
+
+    m_skinnedPipeline = createSkinnedPipeline(m_vk.device, m_offscreen.renderPass,
+        m_offscreen.extent,
+        m_descriptors.sceneSetLayout, m_descriptors.materialSetLayout, m_boneSetLayout,
+        "shaders/mesh_skinned.vert.spv", "shaders/mesh.frag.spv");
+
     // Post-FX pipelines + descriptor sets
-    createPostFXPipelines(m_postFX, m_vk.device, m_bloom, m_ssao, m_composite,
+    createPostFXPipelines(m_postFX, m_vk.device, m_bloom, m_ssao, m_composite, m_ldr,
                           m_offscreen, m_swapchain.renderPass, MAX_FRAMES_IN_FLIGHT);
 
     allocateCommandBuffers(m_renderer, m_vk.device);
@@ -187,7 +249,9 @@ void Engine::run() {
 
         m_debugUI.beginFrame();
         m_debugUI.buildUI(m_scene.registry(), m_resources, m_camera, m_shadow,
-                          m_postFXSettings, dt);
+                          m_postFXSettings,
+                          m_visibleEntities, m_totalEntities,
+                          dt);
         m_debugUI.endFrame();
 
         uint32_t frame = m_renderer.currentFrame;
@@ -211,23 +275,55 @@ void Engine::run() {
         updateSSAOUbo(m_ssao, frame, proj, invProj, m_swapchain.extent, m_postFXSettings);
         updateCompositeUbo(m_composite, frame, m_postFXSettings);
 
+        // Advance animators and update bone palette UBO for this frame
+        BonePalette palette{};
+        bool anySkinned = false;
+        auto animView = m_scene.registry().view<AnimatorComponent>();
+        for (auto e : animView) {
+            auto& a = animView.get<AnimatorComponent>(e);
+            if (a.playing) a.time += dt * a.speed;
+            if (!m_skinnedMesh.animations.empty()) {
+                int ai = std::min(a.animationIndex,
+                                  static_cast<int>(m_skinnedMesh.animations.size()) - 1);
+                computeBoneMatrices(m_skinnedMesh.skeleton,
+                                    m_skinnedMesh.animations[ai], a.time, palette);
+                anySkinned = true;
+                break; // single-entity skinned support for now
+            }
+        }
+        if (anySkinned) {
+            std::memcpy(m_boneMapped[frame], &palette, sizeof(palette));
+        }
+
+        // Build camera frustum for culling
+        Frustum frustum = extractFrustum(proj * ubo.view);
+
         DrawFrameInfo info{};
-        info.mainPipeline   = m_pipeline.graphicsPipeline;
-        info.mainLayout     = m_pipeline.pipelineLayout;
-        info.shadowPipeline = m_shadowPipeline.graphicsPipeline;
-        info.shadowLayout   = m_shadowPipeline.pipelineLayout;
-        info.descriptors    = &m_descriptors;
-        info.shadow         = &m_shadow;
-        info.offscreen      = &m_offscreen;
-        info.bloom          = &m_bloom;
-        info.ssao           = &m_ssao;
-        info.composite      = &m_composite;
-        info.postfx         = &m_postFX;
-        info.settings       = &m_postFXSettings;
-        info.ubo            = &ubo;
-        info.cascadeUbo     = &cascadeUbo;
-        info.registry       = &m_scene.registry();
-        info.resources      = &m_resources;
+        info.mainPipeline    = m_pipeline.graphicsPipeline;
+        info.mainLayout      = m_pipeline.pipelineLayout;
+        info.shadowPipeline  = m_shadowPipeline.graphicsPipeline;
+        info.shadowLayout    = m_shadowPipeline.pipelineLayout;
+        info.descriptors     = &m_descriptors;
+        info.shadow          = &m_shadow;
+        info.offscreen       = &m_offscreen;
+        info.bloom           = &m_bloom;
+        info.ssao            = &m_ssao;
+        info.composite       = &m_composite;
+        info.ldr             = &m_ldr;
+        info.postfx          = &m_postFX;
+        info.settings        = &m_postFXSettings;
+        info.ubo             = &ubo;
+        info.cascadeUbo      = &cascadeUbo;
+        info.cameraFrustum   = &frustum;
+        info.instances       = &m_instances;
+        info.skinnedMesh     = &m_skinnedMesh;
+        info.skinnedPipeline = m_skinnedPipeline.graphicsPipeline;
+        info.skinnedLayout   = m_skinnedPipeline.pipelineLayout;
+        info.boneDescriptorSet = m_boneDescSets[frame];
+        info.visibleEntities = &m_visibleEntities;
+        info.totalEntities   = &m_totalEntities;
+        info.registry        = &m_scene.registry();
+        info.resources       = &m_resources;
 
         bool needsRecreation = drawFrame(m_renderer, m_swapchain, m_vk.device,
                                           m_vk.graphicsQueue, m_vk.presentQueue,
@@ -252,6 +348,7 @@ void Engine::recreateSwapchain() {
 
     // Tear down post-FX (depend on extent + offscreen image views)
     destroyPostFXPipelines(m_vk.device, m_postFX);
+    destroyLdrTarget(m_vk.device, m_ldr);
     destroyOffscreenTarget(m_vk.device, m_offscreen);
     destroyBloomChain(m_vk.device, m_bloom);
     // Keep SSAO noise + UBOs but recreate target for the new extent
@@ -352,6 +449,7 @@ void Engine::recreateSwapchain() {
         (void)size;
     }
     createCompositeData(m_composite, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
+    createLdrTarget(m_ldr, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
 
     // Recreate main pipeline (its renderpass and viewport baked from offscreen)
     m_pipeline = createGraphicsPipeline(m_vk.device, m_offscreen.renderPass,
@@ -359,8 +457,8 @@ void Engine::recreateSwapchain() {
                                         m_descriptors.sceneSetLayout, m_descriptors.materialSetLayout,
                                         "shaders/mesh.vert.spv", "shaders/mesh.frag.spv");
 
-    // Recreate post-FX pipelines (bloom/ssao/composite) and descriptor sets
-    createPostFXPipelines(m_postFX, m_vk.device, m_bloom, m_ssao, m_composite,
+    // Recreate post-FX pipelines + descriptor sets
+    createPostFXPipelines(m_postFX, m_vk.device, m_bloom, m_ssao, m_composite, m_ldr,
                           m_offscreen, m_swapchain.renderPass, MAX_FRAMES_IN_FLIGHT);
 
     m_camera.setAspectRatio(static_cast<float>(m_swapchain.extent.width) /
@@ -375,6 +473,7 @@ void Engine::cleanup() {
     m_debugUI.cleanup(m_vk.device);
 
     destroyPostFXPipelines(m_vk.device, m_postFX);
+    destroyLdrTarget(m_vk.device, m_ldr);
     destroyCompositeData(m_vk.device, m_composite);
     destroySSAO(m_vk.device, m_ssao);
     destroyBloomChain(m_vk.device, m_bloom);
@@ -384,7 +483,18 @@ void Engine::cleanup() {
     for (auto& ub : m_descriptors.uniformBuffers) destroyBuffer(m_vk.device, ub);
 
     destroyLightBuffers(m_vk.device, m_lightBuffers);
+    destroyInstanceBuffer(m_vk.device, m_instances);
     destroyShadowResources(m_vk.device, m_shadow);
+
+    // Skeletal
+    for (auto& b : m_boneUbos) destroyBuffer(m_vk.device, b);
+    m_boneUbos.clear(); m_boneMapped.clear(); m_boneDescSets.clear();
+    if (m_boneSetLayout) vkDestroyDescriptorSetLayout(m_vk.device, m_boneSetLayout, nullptr);
+    if (m_skinnedPipeline.graphicsPipeline)
+        vkDestroyPipeline(m_vk.device, m_skinnedPipeline.graphicsPipeline, nullptr);
+    if (m_skinnedPipeline.pipelineLayout)
+        vkDestroyPipelineLayout(m_vk.device, m_skinnedPipeline.pipelineLayout, nullptr);
+    destroySkinnedMesh(m_vk.device, m_skinnedMesh);
 
     m_resources.cleanup();
 

@@ -113,6 +113,7 @@ static const char* lightTypeName(entt::registry& reg, entt::entity e) {
 
 void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
                       Camera& camera, ShadowData& shadow, PostFXSettings& postfx,
+                      int visibleEntities, int totalEntities,
                       float deltaTime)
 {
     // FPS calc
@@ -274,6 +275,41 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             registry.emplace<MaterialComponent>(e, mat);
             m_selectedEntity = e;
         }
+        if (ImGui::Button("Spawn Skinned Test")) {
+            auto e = registry.create();
+            registry.emplace<NameComponent>(e, std::string("Skinned"));
+            TransformComponent t{}; t.position = { 3.0f, -0.4f, 0.0f };
+            registry.emplace<TransformComponent>(e, t);
+            registry.emplace<SkinnedMeshComponent>(e);
+            registry.emplace<AnimatorComponent>(e);
+            MaterialComponent mat{};
+            mat.texture   = resources.getDefaultTexture();
+            mat.color     = glm::vec4(0.7f, 0.5f, 0.95f, 1.0f);
+            mat.metallic  = 0.1f;
+            mat.roughness = 0.5f;
+            registry.emplace<MaterialComponent>(e, mat);
+            m_selectedEntity = e;
+        }
+        if (ImGui::Button("Spawn 1000 Cubes (instanced demo)")) {
+            for (int i = 0; i < 1000; ++i) {
+                auto e = registry.create();
+                registry.emplace<NameComponent>(e, std::string("Inst"));
+                TransformComponent t{};
+                float x = (float)((i % 40) - 20) * 1.5f;
+                float z = (float)((i / 40) - 12) * 1.5f;
+                t.position = { x, 0.5f, z };
+                t.scale    = { 0.5f, 0.5f, 0.5f };
+                registry.emplace<TransformComponent>(e, t);
+                registry.emplace<MeshComponent>(e, resources.getDefaultCube());
+                MaterialComponent mat{};
+                mat.texture   = resources.getDefaultTexture();
+                float h       = (float)i / 1000.0f;
+                mat.color     = glm::vec4(0.4f + h * 0.6f, 0.5f, 1.0f - h * 0.5f, 1.0f);
+                mat.metallic  = (i % 3 == 0) ? 1.0f : 0.0f;
+                mat.roughness = 0.2f + ((i * 37) % 100) / 100.0f * 0.6f;
+                registry.emplace<MaterialComponent>(e, mat);
+            }
+        }
     }
     ImGui::End();
 
@@ -286,6 +322,9 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
         int entityCount = 0;
         for (auto e : registry.view<NameComponent>()) { (void)e; entityCount++; }
         ImGui::Text("Entities: %d", entityCount);
+        ImGui::Text("Drawable: %d   Visible: %d   Culled: %d",
+                    totalEntities, visibleEntities,
+                    totalEntities - visibleEntities);
     }
     ImGui::End();
 
@@ -401,6 +440,10 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             ImGui::SliderFloat("Radius",    &postfx.ssaoRadius,    0.05f, 2.0f);
             ImGui::SliderFloat("Bias",      &postfx.ssaoBias,      0.0f, 0.1f);
             ImGui::SliderFloat("Intensity", &postfx.ssaoIntensity, 0.5f, 4.0f);
+        }
+        if (ImGui::CollapsingHeader("Anti-Aliasing", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("FXAA", &postfx.fxaaEnabled);
+            ImGui::TextDisabled("Edge-aware luma blur, ~0.2ms at 720p");
         }
         if (ImGui::CollapsingHeader("Vignette")) {
             ImGui::SliderFloat("Intensity", &postfx.vignetteIntensity, 0.0f, 1.0f);

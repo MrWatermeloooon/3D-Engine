@@ -23,6 +23,7 @@ public:
     void beginFrame();
     void buildUI(entt::registry& registry, ResourceManager& resources,
                  Camera& camera, ShadowData& shadow, PostFXSettings& postfx,
+                 int visibleEntities, int totalEntities,
                  float deltaTime);
     void endFrame();
 

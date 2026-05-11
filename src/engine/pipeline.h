@@ -18,3 +18,10 @@ PipelineData createGraphicsPipeline(VkDevice device, VkRenderPass renderPass, Vk
 PipelineData createShadowPipeline(VkDevice device, VkRenderPass shadowRenderPass,
                                   uint32_t shadowMapSize,
                                   const std::string& vertPath);
+
+// Skinned mesh pipeline (separate vertex layout: SkinnedVertex + bone palette set)
+PipelineData createSkinnedPipeline(VkDevice device, VkRenderPass renderPass, VkExtent2D extent,
+                                   VkDescriptorSetLayout sceneSetLayout,
+                                   VkDescriptorSetLayout materialSetLayout,
+                                   VkDescriptorSetLayout boneSetLayout,
+                                   const std::string& vertPath, const std::string& fragPath);

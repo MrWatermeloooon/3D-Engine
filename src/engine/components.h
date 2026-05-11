@@ -69,3 +69,14 @@ struct SpotLightComponent {
     float innerConeDeg = 20.0f;
     float outerConeDeg = 30.0f;
 };
+
+// Marker — engine renders any entity with this component using its single
+// shared skinned mesh resource. (Multi-skinned-mesh support is a future extension.)
+struct SkinnedMeshComponent {};
+
+struct AnimatorComponent {
+    int   animationIndex = 0;
+    float time           = 0.0f;
+    float speed          = 1.0f;
+    bool  playing        = true;
+};

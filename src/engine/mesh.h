@@ -12,6 +12,10 @@ struct Mesh {
 
     AllocatedBuffer vertexBuffer;
     AllocatedBuffer indexBuffer;
+
+    // Local-space AABB (computed from vertices)
+    glm::vec3 aabbMin{0.0f};
+    glm::vec3 aabbMax{0.0f};
 };
 
 Mesh loadMeshFromObj(const std::string& filepath);

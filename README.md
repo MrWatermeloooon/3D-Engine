@@ -6,12 +6,15 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 
 - Vulkan renderer with swapchain, command buffers, descriptor management, and pipeline setup.
 - Mesh, texture, buffer, camera, scene, and resource manager systems.
+- Mesh-local AABB generation and frustum culling against extracted view-projection planes.
+- Instanced rendering path with per-instance transform, color, metallic, and roughness data.
 - Entity/component scene structure using EnTT.
 - Directional lighting support with cascaded shadow maps.
 - HDR offscreen rendering target.
 - Bloom downsample/upsample pass.
 - SSAO pass with configurable kernel and debug views.
-- Composite post-processing with exposure, gamma, saturation, contrast, vignette, and tone mapping controls.
+- Composite post-processing with exposure, gamma, saturation, contrast, vignette, tone mapping, and FXAA controls.
+- Skeletal animation infrastructure with skeletons, animation channels, skinned vertex data, bone palette uploads, and a test bone-chain demo.
 - ImGui debug UI and ImGuizmo integration.
 - GLSL shader compilation to SPIR-V through CMake.
 
@@ -86,10 +89,8 @@ The repository intentionally ignores local build output, Visual Studio metadata,
 
 ### Core Rendering
 
-- Skeletal animation: bone transforms, skinning shader, glTF skeleton support.
-- Frustum culling: AABB tests and skipping invisible draw calls.
-- Instanced rendering: draw 10k trees with one call.
-- Anti-aliasing: MSAA, TAA, or FXAA depending on the quality/performance tradeoff.
+- glTF skeletal animation importer: load skins, joints, inverse-bind matrices, vertex weights, and animation channels from glTF files.
+- Skeletal animation UI polish: expose animator time, speed, clip selection, and playback controls in the properties panel.
 - Normal mapping: tangent-space normals with optional parallax.
 - Skybox + IBL: HDR environment map, irradiance, and specular probe.
 
