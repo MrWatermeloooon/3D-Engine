@@ -20,7 +20,7 @@ struct MeshEntry {
 
 struct TextureEntry {
     TextureData texture;
-    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    uint32_t    bindlessSlot = 0;     // index into the global bindless array
     std::string path;
     std::filesystem::file_time_type lastWrite;
     bool isBuiltin = false;
@@ -41,7 +41,8 @@ public:
 
     const Mesh& getMesh(MeshHandle handle) const { return m_meshes[handle.id].mesh; }
     const TextureData& getTexture(TextureHandle handle) const { return m_textures[handle.id].texture; }
-    VkDescriptorSet getMaterialSet(TextureHandle handle) const { return m_textures[handle.id].descriptorSet; }
+    uint32_t getBindlessSlot(TextureHandle handle) const { return m_textures[handle.id].bindlessSlot; }
+    VkDescriptorSet bindlessSet() const { return m_descriptors->bindlessTexturesSet; }
 
     void pollHotReload();
     void cleanup();

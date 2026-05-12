@@ -23,17 +23,18 @@ void ResourceManager::init(VkPhysicalDevice physicalDevice, VkDevice device,
     m_defaultCube = { static_cast<uint32_t>(m_meshes.size()) };
     m_meshes.push_back(std::move(cubeEntry));
 
-    // Default checkerboard texture
+    // Default white texture, registered as bindless slot 0
     auto tex = createDefaultTexture(m_physicalDevice, m_device, m_commandPool, m_queue);
-    auto descSet = allocateMaterialDescriptorSet(descriptors, m_device, tex.imageView, tex.sampler);
+    uint32_t slot = static_cast<uint32_t>(m_textures.size());
+    writeBindlessTexture(descriptors, m_device, slot, tex.imageView, tex.sampler);
 
     TextureEntry texEntry;
-    texEntry.texture = tex;
-    texEntry.descriptorSet = descSet;
-    texEntry.path = "__builtin_checkerboard";
-    texEntry.isBuiltin = true;
+    texEntry.texture      = tex;
+    texEntry.bindlessSlot = slot;
+    texEntry.path         = "__builtin_white";
+    texEntry.isBuiltin    = true;
 
-    m_defaultTexture = { static_cast<uint32_t>(m_textures.size()) };
+    m_defaultTexture = { slot };
     m_textures.push_back(std::move(texEntry));
 
     std::cout << "[ResourceManager] Initialized with default assets\n";
@@ -75,15 +76,16 @@ TextureHandle ResourceManager::loadTexture(const std::string& path) {
     if (it != m_textureLookup.end()) return it->second;
 
     auto tex = createTextureFromFile(m_physicalDevice, m_device, m_commandPool, m_queue, path);
-    auto descSet = allocateMaterialDescriptorSet(*m_descriptors, m_device, tex.imageView, tex.sampler);
+    uint32_t slot = static_cast<uint32_t>(m_textures.size());
+    writeBindlessTexture(*m_descriptors, m_device, slot, tex.imageView, tex.sampler);
 
     TextureEntry entry;
-    entry.texture = tex;
-    entry.descriptorSet = descSet;
-    entry.path = path;
-    entry.lastWrite = std::filesystem::last_write_time(path);
+    entry.texture      = tex;
+    entry.bindlessSlot = slot;
+    entry.path         = path;
+    entry.lastWrite    = std::filesystem::last_write_time(path);
 
-    TextureHandle handle = { static_cast<uint32_t>(m_textures.size()) };
+    TextureHandle handle = { slot };
     m_textures.push_back(std::move(entry));
     m_textureLookup[path] = handle;
     return handle;
@@ -113,13 +115,13 @@ void ResourceManager::pollHotReload() {
                 std::cout << "[ResourceManager] Hot-reloading texture: " << entry.path << "\n";
                 vkDeviceWaitIdle(m_device);
 
-                vkFreeDescriptorSets(m_device, m_descriptors->descriptorPool, 1, &entry.descriptorSet);
                 destroyTexture(m_device, entry.texture);
-
                 entry.texture = createTextureFromFile(m_physicalDevice, m_device,
                                                       m_commandPool, m_queue, entry.path);
-                entry.descriptorSet = allocateMaterialDescriptorSet(
-                    *m_descriptors, m_device, entry.texture.imageView, entry.texture.sampler);
+                // Re-write the same bindless slot — UPDATE_AFTER_BIND lets this
+                // happen even while the set is in use.
+                writeBindlessTexture(*m_descriptors, m_device, entry.bindlessSlot,
+                                     entry.texture.imageView, entry.texture.sampler);
                 entry.lastWrite = currentTime;
             }
         } catch (...) {}

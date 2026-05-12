@@ -6,12 +6,15 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inTexCoord;
 layout(location = 3) in vec3 inColor;
 // Per-instance (binding 1)
-layout(location = 4) in vec4 instModel0;
-layout(location = 5) in vec4 instModel1;
-layout(location = 6) in vec4 instModel2;
-layout(location = 7) in vec4 instModel3;
-layout(location = 8) in vec4 instColorTint;
-layout(location = 9) in vec4 instMatParams; // x=metallic, y=roughness
+layout(location = 4)  in vec4 instModel0;
+layout(location = 5)  in vec4 instModel1;
+layout(location = 6)  in vec4 instModel2;
+layout(location = 7)  in vec4 instModel3;
+layout(location = 8)  in vec4 instColorTint;
+layout(location = 9)  in vec4 instMatParams;  // x=metallic, y=roughness, z=textureIndex
+layout(location = 10) in vec4 instNormal0;    // precomputed normal matrix cols
+layout(location = 11) in vec4 instNormal1;
+layout(location = 12) in vec4 instNormal2;
 
 layout(set = 0, binding = 0) uniform SceneUBO {
     mat4 view;
@@ -39,7 +42,8 @@ void main() {
 
     vColor      = inColor;
     vTexCoord   = inTexCoord;
-    vNormal     = mat3(transpose(inverse(model))) * inNormal;
+    mat3 normalMat = mat3(instNormal0.xyz, instNormal1.xyz, instNormal2.xyz);
+    vNormal     = normalMat * inNormal;
     vColorTint  = instColorTint;
     vMatParams  = instMatParams;
 }

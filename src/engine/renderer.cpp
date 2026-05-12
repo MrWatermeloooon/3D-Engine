@@ -4,6 +4,7 @@
 #include "frustum.h"
 #include "instancing.h"
 #include "skeletal.h"
+#include "jobs.h"
 #include "../utils/vk_check.h"
 
 #include <imgui.h>
@@ -47,9 +48,11 @@ struct PendingInstance {
 struct InstanceBatch {
     MeshHandle    mesh;
     TextureHandle texture;
-    uint32_t      offset;       // start index in instance buffer
-    uint32_t      visibleCount; // first N instances are visible (in frustum)
-    uint32_t      totalCount;   // all instances (used for shadow pass)
+    uint32_t      offset;          // start index in instance buffer
+    uint32_t      visibleCount;    // first N instances are visible (in frustum)
+    uint32_t      totalCount;      // all instances (used for shadow pass)
+    uint32_t      mainCmdIndex;    // index in indirect buffer (main pass)
+    uint32_t      shadowCmdIndex;  // index in indirect buffer (shadow pass)
 };
 
 // Build per-frame batches: gathers renderable entities, frustum-tests them,
@@ -59,10 +62,22 @@ static std::vector<InstanceBatch> buildBatches(
     entt::registry& registry, ResourceManager& resources,
     const Frustum& frustum,
     InstanceData* mapped, uint32_t capacity,
-    int& outVisible, int& outTotal)
+    VkDrawIndexedIndirectCommand* indirectMapped, uint32_t indirectCapacity,
+    int& outVisible, int& outTotal,
+    JobSystem* jobs)
 {
-    std::vector<PendingInstance> pending;
-    pending.reserve(64);
+    // Stage 1 (single-threaded): collect raw entity refs in a flat array.
+    // EnTT registry views aren't safe to iterate concurrently with writes.
+    struct EntityRef {
+        uint32_t meshId;
+        uint32_t textureId;
+        glm::vec3 aabbMin, aabbMax;
+        TransformComponent transform;
+        MaterialComponent  material;
+    };
+
+    std::vector<EntityRef> refs;
+    refs.reserve(256);
 
     auto view = registry.view<TransformComponent, MeshComponent, MaterialComponent>();
     for (auto entity : view) {
@@ -71,19 +86,46 @@ static std::vector<InstanceBatch> buildBatches(
         auto& mat  = view.get<MaterialComponent>(entity);
         const Mesh& mesh = resources.getMesh(mc.handle);
 
-        glm::mat4 model = tr.getMatrix();
+        EntityRef r;
+        r.meshId    = mc.handle.id;
+        r.textureId = mat.texture.id;
+        r.aabbMin   = mesh.aabbMin;
+        r.aabbMax   = mesh.aabbMax;
+        r.transform = tr;
+        r.material  = mat;
+        refs.push_back(r);
+    }
+
+    // Stage 2 (parallel): per-entity compute model matrix, normal matrix,
+    // world AABB and frustum test. Independent per entity → ideal for parallel_for.
+    std::vector<PendingInstance> pending(refs.size());
+    auto computeOne = [&](size_t i) {
+        const auto& r = refs[i];
+        glm::mat4 model = r.transform.getMatrix();
         glm::vec3 wMin, wMax;
-        transformAabb(model, mesh.aabbMin, mesh.aabbMax, wMin, wMax);
+        transformAabb(model, r.aabbMin, r.aabbMax, wMin, wMax);
         bool visible = aabbInFrustum(frustum, wMin, wMax);
 
         PendingInstance p;
-        p.meshId    = mc.handle.id;
-        p.textureId = mat.texture.id;
+        p.meshId    = r.meshId;
+        p.textureId = r.textureId;
         p.visible   = visible;
         p.data.model      = model;
-        p.data.colorTint  = mat.color;
-        p.data.matParams  = glm::vec4(mat.metallic, mat.roughness, 0.0f, 0.0f);
-        pending.push_back(p);
+        p.data.colorTint  = r.material.color;
+        p.data.matParams  = glm::vec4(r.material.metallic, r.material.roughness,
+                                       static_cast<float>(r.textureId), 0.0f);
+        glm::mat3 nm = glm::transpose(glm::inverse(glm::mat3(model)));
+        p.data.normalCol0 = glm::vec4(nm[0], 0.0f);
+        p.data.normalCol1 = glm::vec4(nm[1], 0.0f);
+        p.data.normalCol2 = glm::vec4(nm[2], 0.0f);
+        pending[i] = p;
+    };
+
+    // Use job system for big counts; small counts run inline (lower overhead).
+    if (jobs && refs.size() > 256) {
+        jobs->parallel_for(refs.size(), computeOne);
+    } else {
+        for (size_t i = 0; i < refs.size(); ++i) computeOne(i);
     }
 
     // Sort: group by (mesh, texture), visible-first within each group
@@ -121,8 +163,35 @@ static std::vector<InstanceBatch> buildBatches(
         }
         b.visibleCount = visCount;
         b.totalCount   = end - i;
+        b.mainCmdIndex   = static_cast<uint32_t>(batches.size());
+        b.shadowCmdIndex = 0;   // patched below after we know batch count
         batches.push_back(b);
         i = end;
+    }
+
+    // Author indirect commands: first batches.size() entries are MAIN draws
+    // (instanceCount = visible), next batches.size() entries are SHADOW draws
+    // (instanceCount = total). Same indirect buffer, two contiguous regions.
+    uint32_t N = static_cast<uint32_t>(batches.size());
+    if (indirectMapped && N * 2 <= indirectCapacity) {
+        for (uint32_t b = 0; b < N; ++b) {
+            const auto& batch = batches[b];
+            const Mesh& mesh = resources.getMesh(batch.mesh);
+
+            VkDrawIndexedIndirectCommand mainCmd{};
+            mainCmd.indexCount    = static_cast<uint32_t>(mesh.indices.size());
+            mainCmd.instanceCount = batch.visibleCount;
+            mainCmd.firstIndex    = 0;
+            mainCmd.vertexOffset  = 0;
+            mainCmd.firstInstance = 0;
+            indirectMapped[b] = mainCmd;
+
+            VkDrawIndexedIndirectCommand shadowCmd = mainCmd;
+            shadowCmd.instanceCount = batch.totalCount;
+            indirectMapped[N + b] = shadowCmd;
+
+            batches[b].shadowCmdIndex = N + b;
+        }
     }
 
     return batches;
@@ -135,6 +204,7 @@ static void recordShadowPass(VkCommandBuffer cmd, ShadowData& shadow,
                              const CascadeUBO& cascadeUbo,
                              const std::vector<InstanceBatch>& batches,
                              VkBuffer instanceBuffer,
+                             VkBuffer indirectBuffer,
                              ResourceManager& resources)
 {
     VkClearValue clear{};
@@ -164,8 +234,13 @@ static void recordShadowPass(VkCommandBuffer cmd, ShadowData& shadow,
             vkCmdBindVertexBuffers(cmd, 0, 2, vbs, off);
             vkCmdBindIndexBuffer(cmd, mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
-            vkCmdDrawIndexed(cmd, static_cast<uint32_t>(mesh.indices.size()),
-                             batch.totalCount, 0, 0, 0);
+            // Indirect draw — command parameters (indexCount, instanceCount, etc.)
+            // come from the indirect buffer, not the CPU. drawCount=1 because
+            // each batch has a different vertex/index/instance binding.
+            VkDeviceSize cmdOffset = static_cast<VkDeviceSize>(batch.shadowCmdIndex)
+                                   * sizeof(VkDrawIndexedIndirectCommand);
+            vkCmdDrawIndexedIndirect(cmd, indirectBuffer, cmdOffset, 1,
+                                     sizeof(VkDrawIndexedIndirectCommand));
         }
         vkCmdEndRenderPass(cmd);
     }
@@ -178,6 +253,7 @@ static void recordMainPass(VkCommandBuffer cmd, OffscreenTarget& offscreen,
                            VkDescriptorSet sceneSet,
                            const std::vector<InstanceBatch>& batches,
                            VkBuffer instanceBuffer,
+                           VkBuffer indirectBuffer,
                            ResourceManager& resources)
 {
     std::array<VkClearValue, 2> clearValues{};
@@ -207,24 +283,25 @@ static void recordMainPass(VkCommandBuffer cmd, OffscreenTarget& offscreen,
     VkRect2D scissor{}; scissor.extent = offscreen.extent;
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+    // Bind scene set (0) and bindless texture set (1) ONCE. Materials are now
+    // indexed by texture slot in the per-instance data — no per-draw rebinds.
+    VkDescriptorSet sets[] = { sceneSet, resources.bindlessSet() };
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                            0, 1, &sceneSet, 0, nullptr);
+                            0, 2, sets, 0, nullptr);
 
     for (const auto& batch : batches) {
         if (batch.visibleCount == 0) continue;
         const Mesh& mesh = resources.getMesh(batch.mesh);
-        VkDescriptorSet matSet = resources.getMaterialSet(batch.texture);
-
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                1, 1, &matSet, 0, nullptr);
 
         VkBuffer vbs[] = { mesh.vertexBuffer.buffer, instanceBuffer };
         VkDeviceSize offsets[] = { 0, batch.offset * sizeof(InstanceData) };
         vkCmdBindVertexBuffers(cmd, 0, 2, vbs, offsets);
         vkCmdBindIndexBuffer(cmd, mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
-        vkCmdDrawIndexed(cmd, static_cast<uint32_t>(mesh.indices.size()),
-                         batch.visibleCount, 0, 0, 0);
+        VkDeviceSize cmdOffset = static_cast<VkDeviceSize>(batch.mainCmdIndex)
+                               * sizeof(VkDrawIndexedIndirectCommand);
+        vkCmdDrawIndexedIndirect(cmd, indirectBuffer, cmdOffset, 1,
+                                 sizeof(VkDrawIndexedIndirectCommand));
     }
     // (caller may issue more draws — render pass closes in drawFrame)
 }
@@ -241,10 +318,13 @@ static void recordSkinnedDraws(VkCommandBuffer cmd, const DrawFrameInfo& info, u
     if (view.begin() == view.end()) return;
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, info.skinnedPipeline);
+    VkDescriptorSet sets3[] = {
+        info.descriptors->sceneSets[frame],
+        info.resources->bindlessSet(),
+        info.boneDescriptorSet,
+    };
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, info.skinnedLayout,
-                            0, 1, &info.descriptors->sceneSets[frame], 0, nullptr);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, info.skinnedLayout,
-                            2, 1, &info.boneDescriptorSet, 0, nullptr);
+                            0, 3, sets3, 0, nullptr);
 
     VkBuffer vbs[]   = { info.skinnedMesh->vertexBuffer.buffer };
     VkDeviceSize off[] = { 0 };
@@ -255,18 +335,15 @@ static void recordSkinnedDraws(VkCommandBuffer cmd, const DrawFrameInfo& info, u
         auto& tr  = view.get<TransformComponent>(e);
         auto& mat = view.get<MaterialComponent>(e);
 
-        VkDescriptorSet matSet = info.resources->getMaterialSet(mat.texture);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, info.skinnedLayout,
-                                1, 1, &matSet, 0, nullptr);
-
         struct SkinnedPC {
             glm::mat4 model;
             glm::vec4 color;
-            glm::vec4 matParams;
+            glm::vec4 matParams; // x=metallic, y=roughness, z=textureIndex
         } pc;
         pc.model     = tr.getMatrix();
         pc.color     = mat.color;
-        pc.matParams = glm::vec4(mat.metallic, mat.roughness, 0.0f, 0.0f);
+        pc.matParams = glm::vec4(mat.metallic, mat.roughness,
+                                  static_cast<float>(mat.texture.id), 0.0f);
         vkCmdPushConstants(cmd, info.skinnedLayout, VK_SHADER_STAGE_VERTEX_BIT,
                            0, sizeof(SkinnedPC), &pc);
 
@@ -372,15 +449,19 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
 
     vkResetFences(device, 1, &swapchain.inFlightFences[frame]);
 
-    // Build batches + write to instance buffer for this frame
+    // Build batches + write to instance buffer + indirect commands for this frame
     int vis = 0, tot = 0;
-    auto batches = buildBatches(*info.registry, *info.resources, *info.cameraFrustum,
-                                static_cast<InstanceData*>(info.instances->mapped[frame]),
-                                info.instances->capacity,
-                                vis, tot);
+    auto batches = buildBatches(
+        *info.registry, *info.resources, *info.cameraFrustum,
+        static_cast<InstanceData*>(info.instances->mapped[frame]),
+        info.instances->capacity,
+        static_cast<VkDrawIndexedIndirectCommand*>(info.indirect->mapped[frame]),
+        info.indirect->capacity,
+        vis, tot, info.jobSystem);
     if (info.visibleEntities) *info.visibleEntities = vis;
     if (info.totalEntities)   *info.totalEntities   = tot;
-    VkBuffer instBuf = info.instances->buffers[frame].buffer;
+    VkBuffer instBuf     = info.instances->buffers[frame].buffer;
+    VkBuffer indirectBuf = info.indirect->buffers[frame].buffer;
 
     VkCommandBuffer cmd = renderer.commandBuffers[frame];
     vkResetCommandBuffer(cmd, 0);
@@ -391,13 +472,13 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
 
     // 1. Shadow cascades (uses total count — off-screen objects still cast shadows)
     recordShadowPass(cmd, *info.shadow, info.shadowPipeline, info.shadowLayout,
-                     *info.cascadeUbo, batches, instBuf, *info.resources);
+                     *info.cascadeUbo, batches, instBuf, indirectBuf, *info.resources);
 
     // 2. Main pass: opens offscreen render pass, draws instanced batches,
     //    then draws skinned meshes (same pass — they share the render target).
     recordMainPass(cmd, *info.offscreen, info.mainPipeline, info.mainLayout,
                    info.descriptors->sceneSets[frame],
-                   batches, instBuf, *info.resources);
+                   batches, instBuf, indirectBuf, *info.resources);
     recordSkinnedDraws(cmd, info, frame);
     vkCmdEndRenderPass(cmd);
 

@@ -44,14 +44,28 @@ VkDescriptorSetLayout createSceneSetLayout(VkDevice device) {
 }
 
 VkDescriptorSetLayout createMaterialSetLayout(VkDevice device) {
+    // Bindless: one binding holding an array of BINDLESS_MAX_TEXTURES samplers.
+    // PartiallyBound lets us leave unused slots empty; UpdateAfterBind lets us
+    // register new textures even while the set is bound for a draw.
     VkDescriptorSetLayoutBinding samplerBinding{};
     samplerBinding.binding         = 0;
     samplerBinding.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    samplerBinding.descriptorCount = 1;
+    samplerBinding.descriptorCount = BINDLESS_MAX_TEXTURES;
     samplerBinding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorBindingFlags bindingFlags =
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+        VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flagsCi{};
+    flagsCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+    flagsCi.bindingCount  = 1;
+    flagsCi.pBindingFlags = &bindingFlags;
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.pNext        = &flagsCi;
+    layoutInfo.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
     layoutInfo.bindingCount = 1;
     layoutInfo.pBindings    = &samplerBinding;
 
@@ -79,19 +93,21 @@ void createUniformBuffers(DescriptorData& data, VkPhysicalDevice physicalDevice,
 
 void createDescriptorPool(DescriptorData& data, VkDevice device,
                           uint32_t framesInFlight, uint32_t maxMaterials) {
+    (void)maxMaterials; // bindless: textures live in a single global set
     VkDescriptorPoolSize poolSizes[] = {
         // Scene UBO + lights UBO + cascade UBO + bone UBO per frame
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         framesInFlight * 4 },
-        // Shadow map per frame (one per scene set), plus per-material textures
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, framesInFlight + maxMaterials },
+        // Shadow map per frame + entire bindless texture array (allocated once)
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, framesInFlight + BINDLESS_MAX_TEXTURES },
     };
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    poolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+                           | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     poolInfo.poolSizeCount = 2;
     poolInfo.pPoolSizes    = poolSizes;
-    poolInfo.maxSets       = framesInFlight + maxMaterials + framesInFlight /*bones*/;
+    poolInfo.maxSets       = framesInFlight + 1 /*bindless*/ + framesInFlight /*bones*/;
 
     VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, nullptr, &data.descriptorPool));
 }
@@ -168,32 +184,31 @@ void createSceneDescriptorSets(DescriptorData& data, VkDevice device, uint32_t f
     }
 }
 
-VkDescriptorSet allocateMaterialDescriptorSet(const DescriptorData& data, VkDevice device,
-                                              VkImageView imageView, VkSampler sampler) {
+void allocateBindlessTexturesSet(DescriptorData& data, VkDevice device) {
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocInfo.descriptorPool     = data.descriptorPool;
     allocInfo.descriptorSetCount = 1;
     allocInfo.pSetLayouts        = &data.materialSetLayout;
+    VK_CHECK(vkAllocateDescriptorSets(device, &allocInfo, &data.bindlessTexturesSet));
+}
 
-    VkDescriptorSet set;
-    VK_CHECK(vkAllocateDescriptorSets(device, &allocInfo, &set));
+void writeBindlessTexture(DescriptorData& data, VkDevice device,
+                          uint32_t slot, VkImageView view, VkSampler sampler) {
+    VkDescriptorImageInfo info{};
+    info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    info.imageView   = view;
+    info.sampler     = sampler;
 
-    VkDescriptorImageInfo imageInfo{};
-    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageInfo.imageView   = imageView;
-    imageInfo.sampler     = sampler;
-
-    VkWriteDescriptorSet write{};
-    write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet          = set;
-    write.dstBinding      = 0;
-    write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.descriptorCount = 1;
-    write.pImageInfo      = &imageInfo;
-
-    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
-    return set;
+    VkWriteDescriptorSet w{};
+    w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet          = data.bindlessTexturesSet;
+    w.dstBinding      = 0;
+    w.dstArrayElement = slot;
+    w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.descriptorCount = 1;
+    w.pImageInfo      = &info;
+    vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
 }
 
 void updateUniformBuffer(DescriptorData& data, uint32_t currentFrame,

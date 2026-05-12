@@ -217,14 +217,28 @@ VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyI
         queueInfos.push_back(qi);
     }
 
-    VkPhysicalDeviceFeatures features{};
-    features.samplerAnisotropy = VK_TRUE;
+    // Vulkan 1.2 descriptor-indexing features for bindless rendering
+    VkPhysicalDeviceVulkan12Features vk12{};
+    vk12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    vk12.descriptorIndexing                              = VK_TRUE;
+    vk12.descriptorBindingPartiallyBound                 = VK_TRUE;
+    vk12.descriptorBindingSampledImageUpdateAfterBind    = VK_TRUE;
+    vk12.descriptorBindingVariableDescriptorCount        = VK_TRUE;
+    vk12.runtimeDescriptorArray                          = VK_TRUE;
+    vk12.shaderSampledImageArrayNonUniformIndexing       = VK_TRUE;
+
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &vk12;
+    features2.features.samplerAnisotropy = VK_TRUE;
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    createInfo.pNext                   = &features2;
     createInfo.queueCreateInfoCount    = static_cast<uint32_t>(queueInfos.size());
     createInfo.pQueueCreateInfos       = queueInfos.data();
-    createInfo.pEnabledFeatures        = &features;
+    // When using pNext->VkPhysicalDeviceFeatures2, pEnabledFeatures must be null.
+    createInfo.pEnabledFeatures        = nullptr;
     createInfo.enabledExtensionCount   = static_cast<uint32_t>(DEVICE_EXTENSIONS.size());
     createInfo.ppEnabledExtensionNames = DEVICE_EXTENSIONS.data();
 

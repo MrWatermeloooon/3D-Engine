@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_nonuniform_qualifier : require
 
 const float PI = 3.14159265359;
 const int   MAX_LIGHTS    = 32;
@@ -39,7 +40,8 @@ layout(set = 0, binding = 2) uniform CascadeUBO {
 } cascades;
 
 layout(set = 0, binding = 3) uniform sampler2DArrayShadow shadowMap;
-layout(set = 1, binding = 0) uniform sampler2D albedoTex;
+// Bindless texture array — material chooses its texture via an index in vMatParams.z.
+layout(set = 1, binding = 0) uniform sampler2D bindlessTextures[];
 
 layout(location = 0) out vec4 outColor;
 
@@ -170,7 +172,8 @@ vec3 evaluateLight(Light L, vec3 N, vec3 V, vec3 worldPos, vec3 albedo, vec3 F0,
 }
 
 void main() {
-    vec3 albedoSample = texture(albedoTex, vTexCoord).rgb;
+    int textureIndex = int(vMatParams.z);
+    vec3 albedoSample = texture(bindlessTextures[nonuniformEXT(textureIndex)], vTexCoord).rgb;
     vec3 albedo       = albedoSample * vColor * vColorTint.rgb;
     float metallic    = vMatParams.x;
     float roughness   = clamp(vMatParams.y, 0.04, 1.0);

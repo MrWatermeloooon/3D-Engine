@@ -8,6 +8,9 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Mesh, texture, buffer, camera, scene, and resource manager systems.
 - Mesh-local AABB generation and frustum culling against extracted view-projection planes.
 - Instanced rendering path with per-instance transform, color, metallic, and roughness data.
+- Indirect batched drawing with per-frame `VkDrawIndexedIndirectCommand` buffers.
+- Bindless texture array with descriptor indexing and update-after-bind support.
+- Job system with fire-and-forget tasks, blocking `parallel_for`, and frame-work barriers.
 - Entity/component scene structure using EnTT.
 - Directional lighting support with cascaded shadow maps.
 - HDR offscreen rendering target.
@@ -17,6 +20,15 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Skeletal animation infrastructure with skeletons, animation channels, skinned vertex data, bone palette uploads, and a test bone-chain demo.
 - ImGui debug UI and ImGuizmo integration.
 - GLSL shader compilation to SPIR-V through CMake.
+
+## Recent Optimization Work
+
+- Swapchain SSAO recreation now uses the shared `destroySSAO` and `createSSAO` path instead of a duplicated inline rebuild block.
+- Single-time command submission now waits on a per-call fence instead of stalling the whole graphics queue with `vkQueueWaitIdle`.
+- Instance data now carries a precomputed normal matrix so the vertex shader no longer computes `transpose(inverse(mat3(model)))` per vertex.
+- Frustum culling, world AABB generation, model matrix generation, and normal matrix generation are parallelized for larger entity counts.
+- Main and shadow batches now issue indirect indexed draws, setting up the renderer for future compute-driven visibility.
+- Bindless textures are bound once per pass, with each instance selecting its texture by bindless index.
 
 ## Tech Stack
 
@@ -124,9 +136,7 @@ The repository intentionally ignores local build output, Visual Studio metadata,
 
 ### Performance
 
-- GPU-driven rendering: indirect draw calls where the GPU decides what to draw.
-- Bindless rendering: large descriptor arrays to reduce per-draw descriptor binding overhead.
-- Job system: multi-threaded task scheduler for spreading engine work across CPU cores.
+- Compute-driven culling: have a compute pass write visible draw commands directly into the indirect buffer.
 - LOD system: swap to lower-poly meshes at distance to keep far objects cheap.
 - Occlusion culling: skip objects hidden behind other geometry.
 - Variable rate shading: shade detailed edges at full rate and flat areas more cheaply.

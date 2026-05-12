@@ -65,6 +65,9 @@ void Engine::init() {
     // Instance buffer (capacity 16384 instances per frame — covers 10k+ objects)
     createInstanceBuffer(m_instances, m_vk.physicalDevice, m_vk.device,
                          MAX_FRAMES_IN_FLIGHT, 16384);
+    // Indirect buffer: 2 commands per batch (main + shadow), up to 1024 batches per frame.
+    createIndirectBuffer(m_indirect, m_vk.physicalDevice, m_vk.device,
+                         MAX_FRAMES_IN_FLIGHT, 2048);
 
     // Descriptor set layouts (scene + material)
     m_descriptors.sceneSetLayout    = createSceneSetLayout(m_vk.device);
@@ -73,7 +76,7 @@ void Engine::init() {
     // Scene UBO buffers
     createUniformBuffers(m_descriptors, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
 
-    // Descriptor pool + scene sets (with light + cascade + shadow refs)
+    // Descriptor pool + scene sets (with light + cascade + shadow refs) + bindless texture set
     createDescriptorPool(m_descriptors, m_vk.device, MAX_FRAMES_IN_FLIGHT, 64);
 
     std::vector<VkBuffer> lightBufs, cascadeBufs;
@@ -82,6 +85,7 @@ void Engine::init() {
     createSceneDescriptorSets(m_descriptors, m_vk.device, MAX_FRAMES_IN_FLIGHT,
                               lightBufs, cascadeBufs,
                               m_shadow.arrayView, m_shadow.sampler);
+    allocateBindlessTexturesSet(m_descriptors, m_vk.device);
 
     // Resource manager (default mesh + texture)
     m_resources.init(m_vk.physicalDevice, m_vk.device,
@@ -316,10 +320,12 @@ void Engine::run() {
         info.cascadeUbo      = &cascadeUbo;
         info.cameraFrustum   = &frustum;
         info.instances       = &m_instances;
+        info.indirect        = &m_indirect;
         info.skinnedMesh     = &m_skinnedMesh;
         info.skinnedPipeline = m_skinnedPipeline.graphicsPipeline;
         info.skinnedLayout   = m_skinnedPipeline.pipelineLayout;
         info.boneDescriptorSet = m_boneDescSets[frame];
+        info.jobSystem       = &m_jobs;
         info.visibleEntities = &m_visibleEntities;
         info.totalEntities   = &m_totalEntities;
         info.registry        = &m_scene.registry();
@@ -351,29 +357,7 @@ void Engine::recreateSwapchain() {
     destroyLdrTarget(m_vk.device, m_ldr);
     destroyOffscreenTarget(m_vk.device, m_offscreen);
     destroyBloomChain(m_vk.device, m_bloom);
-    // Keep SSAO noise + UBOs but recreate target for the new extent
-    {
-        for (auto& b : m_ssao.ubos) destroyBuffer(m_vk.device, b);
-        m_ssao.ubos.clear(); m_ssao.uboMapped.clear();
-        if (m_ssao.sampler)     vkDestroySampler(m_vk.device, m_ssao.sampler, nullptr);
-        if (m_ssao.framebuffer) vkDestroyFramebuffer(m_vk.device, m_ssao.framebuffer, nullptr);
-        if (m_ssao.renderPass)  vkDestroyRenderPass(m_vk.device, m_ssao.renderPass, nullptr);
-        if (m_ssao.view)        vkDestroyImageView(m_vk.device, m_ssao.view, nullptr);
-        if (m_ssao.image.image) {
-            vkDestroyImage(m_vk.device, m_ssao.image.image, nullptr);
-            vkFreeMemory(m_vk.device, m_ssao.image.memory, nullptr);
-        }
-        // Keep noise + sampler:
-        VkImage  noiseImg    = m_ssao.noiseImage.image;
-        VkDeviceMemory noiseMem = m_ssao.noiseImage.memory;
-        VkImageView noiseV   = m_ssao.noiseView;
-        VkSampler   noiseS   = m_ssao.noiseSampler;
-        m_ssao = {};
-        m_ssao.noiseImage.image  = noiseImg;
-        m_ssao.noiseImage.memory = noiseMem;
-        m_ssao.noiseView         = noiseV;
-        m_ssao.noiseSampler      = noiseS;
-    }
+    destroySSAO(m_vk.device, m_ssao);
     destroyCompositeData(m_vk.device, m_composite);
     vkDestroyPipeline(m_vk.device, m_pipeline.graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(m_vk.device, m_pipeline.pipelineLayout, nullptr);
@@ -386,68 +370,13 @@ void Engine::recreateSwapchain() {
     createFramebuffers(m_swapchain, m_vk.device);
     createPresentSemaphores(m_swapchain, m_vk.device);
 
-    // Recreate offscreen + bloom + ssao target + composite
+    // Recreate offscreen + bloom + ssao + composite + ldr
     createOffscreenTarget(m_offscreen, m_vk.physicalDevice, m_vk.device,
                           m_swapchain.extent, m_depthFormat);
     createBloomChain(m_bloom, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
-
-    // Re-create SSAO target portion (preserve noise that we kept above)
-    {
-        m_ssao.extent = { std::max(1u, m_swapchain.extent.width / 2),
-                          std::max(1u, m_swapchain.extent.height / 2) };
-        constexpr VkFormat fmt = VK_FORMAT_R8_UNORM;
-        m_ssao.image = createImage(m_vk.physicalDevice, m_vk.device,
-            m_ssao.extent.width, m_ssao.extent.height, 1, fmt, VK_IMAGE_TILING_OPTIMAL,
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        m_ssao.view = createImageView(m_vk.device, m_ssao.image.image, fmt,
-                                      VK_IMAGE_ASPECT_COLOR_BIT, 1);
-
-        // Render pass + framebuffer
-        VkAttachmentDescription a{};
-        a.format = fmt; a.samples = VK_SAMPLE_COUNT_1_BIT;
-        a.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        a.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        a.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        VkAttachmentReference r{}; r.attachment = 0; r.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        VkSubpassDescription sub{}; sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        sub.colorAttachmentCount = 1; sub.pColorAttachments = &r;
-        VkRenderPassCreateInfo rp{}; rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        rp.attachmentCount = 1; rp.pAttachments = &a; rp.subpassCount = 1; rp.pSubpasses = &sub;
-        vkCreateRenderPass(m_vk.device, &rp, nullptr, &m_ssao.renderPass);
-
-        VkFramebufferCreateInfo fb{};
-        fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        fb.renderPass = m_ssao.renderPass; fb.attachmentCount = 1;
-        fb.pAttachments = &m_ssao.view;
-        fb.width = m_ssao.extent.width; fb.height = m_ssao.extent.height; fb.layers = 1;
-        vkCreateFramebuffer(m_vk.device, &fb, nullptr, &m_ssao.framebuffer);
-
-        VkSamplerCreateInfo s{};
-        s.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        s.magFilter = VK_FILTER_LINEAR; s.minFilter = VK_FILTER_LINEAR;
-        s.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        s.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        s.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        vkCreateSampler(m_vk.device, &s, nullptr, &m_ssao.sampler);
-
-        VkDeviceSize size = sizeof(glm::mat4) * 2 + sizeof(glm::vec4) * 32 + 32; // see SSAOUboCpu
-        // Actually use exact layout — easier to call createSSAO. But createSSAO would re-upload noise.
-        // Instead re-allocate UBOs only:
-        m_ssao.ubos.resize(MAX_FRAMES_IN_FLIGHT);
-        m_ssao.uboMapped.resize(MAX_FRAMES_IN_FLIGHT);
-        // Use sizeof of struct via a known constant; simpler to allocate enough:
-        VkDeviceSize uboSize = 64 + 64 + 16 * 32 + 32; // matches SSAOUboCpu
-        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-            m_ssao.ubos[i] = createBuffer(m_vk.physicalDevice, m_vk.device, uboSize,
-                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            vkMapMemory(m_vk.device, m_ssao.ubos[i].memory, 0, uboSize, 0, &m_ssao.uboMapped[i]);
-        }
-        (void)size;
-    }
+    createSSAO(m_ssao, m_vk.physicalDevice, m_vk.device,
+               m_renderer.commandPool, m_vk.graphicsQueue,
+               m_swapchain.extent, MAX_FRAMES_IN_FLIGHT);
     createCompositeData(m_composite, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
     createLdrTarget(m_ldr, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
 
@@ -484,6 +413,7 @@ void Engine::cleanup() {
 
     destroyLightBuffers(m_vk.device, m_lightBuffers);
     destroyInstanceBuffer(m_vk.device, m_instances);
+    destroyIndirectBuffer(m_vk.device, m_indirect);
     destroyShadowResources(m_vk.device, m_shadow);
 
     // Skeletal

@@ -18,6 +18,7 @@
 #include "postfx.h"
 #include "instancing.h"
 #include "skeletal.h"
+#include "jobs.h"
 
 class Engine {
 public:
@@ -48,6 +49,7 @@ private:
     LightBufferData  m_lightBuffers;
     ShadowData       m_shadow;
     InstanceBuffer   m_instances;
+    IndirectBuffer   m_indirect;
 
     // Skeletal animation
     SkinnedMesh                  m_skinnedMesh;
@@ -67,6 +69,9 @@ private:
     PostFXSettings   m_postFXSettings{};
 
     VkFormat         m_depthFormat = VK_FORMAT_UNDEFINED;
+
+    // Job system
+    JobSystem        m_jobs;
 
     // Per-frame stats
     int    m_visibleEntities = 0;

@@ -38,6 +38,7 @@ set(SOURCES
     src/engine/frustum.cpp
     src/engine/instancing.cpp
     src/engine/skeletal.cpp
+    src/engine/jobs.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})

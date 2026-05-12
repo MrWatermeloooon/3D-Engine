@@ -46,12 +46,15 @@ struct DrawFrameInfo {
     CascadeUBO*          cascadeUbo;
     Frustum*             cameraFrustum;
     InstanceBuffer*      instances;
+    IndirectBuffer*      indirect;
 
     // Skeletal animation
     SkinnedMesh*         skinnedMesh        = nullptr;
     VkPipeline           skinnedPipeline    = VK_NULL_HANDLE;
     VkPipelineLayout     skinnedLayout      = VK_NULL_HANDLE;
     VkDescriptorSet      boneDescriptorSet  = VK_NULL_HANDLE;
+
+    class JobSystem*     jobSystem          = nullptr;
 
     // Per-frame stats (written by drawFrame, read by UI)
     int* visibleEntities = nullptr;
