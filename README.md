@@ -2,6 +2,8 @@
 
 A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine systems, and modern rendering features. The project is built with CMake and vcpkg, uses GLFW for windowing, GLM for math, EnTT for scene data, and ImGui/ImGuizmo for runtime debugging and editor-style controls.
 
+> **Work in progress:** this engine is actively being developed. Some systems are experimental, APIs may change, and features listed in the roadmap are planned or partially implemented rather than production-ready.
+
 ## Current Features
 
 - Vulkan renderer with swapchain, command buffers, descriptor management, and pipeline setup.
