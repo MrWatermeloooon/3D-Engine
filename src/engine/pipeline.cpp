@@ -2,6 +2,7 @@
 #include "vertex.h"
 #include "instancing.h"
 #include "skeletal.h"
+#include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
 #include <fstream>
@@ -116,11 +117,17 @@ PipelineData createGraphicsPipeline(VkDevice device, VkRenderPass renderPass, Vk
     colorBlending.attachmentCount = 1;
     colorBlending.pAttachments    = &blendAttachment;
 
-    VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    // Add VRS dynamic state only when the device supports VK_KHR_fragment_shading_rate.
+    // If we list it on an unsupported device, pipeline creation fails.
+    std::vector<VkDynamicState> dynamicStates = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR
+    };
+    if (VRS_SUPPORTED) dynamicStates.push_back(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
+
     VkPipelineDynamicStateCreateInfo dynamicState{};
     dynamicState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamicState.dynamicStateCount = 2;
-    dynamicState.pDynamicStates    = dynamicStates;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates    = dynamicStates.data();
 
     // No push constants for main pipeline — all per-draw data is per-instance.
     VkDescriptorSetLayout setLayouts[] = { sceneSetLayout, materialSetLayout };

@@ -1,0 +1,46 @@
+#version 450
+
+// Hierarchical Z-buffer reduction.
+//
+// One dispatch per output mip. For each dst texel, sample 2×2 source texels
+// and write their MAX (conservative: a pixel is occluded only if behind the
+// maximum depth in its region).
+//
+// For mip 0 the source is the offscreen depth attachment (a separate image);
+// for subsequent mips the source is the previous HZB mip. The bound sampler2D
+// works for both because depth-aspect views and R32_SFLOAT views sample the
+// same way (single channel in .r).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcMip;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dstMip;
+
+layout(push_constant) uniform PC {
+    ivec2 dstSize;
+    int   isFirstMip;
+    int   _pad0;
+} pc;
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(dst, pc.dstSize))) return;
+
+    // Source mip dimensions are 2× dst (for mip 0, src is depth at full res).
+    ivec2 srcSize = textureSize(srcMip, 0);
+    ivec2 srcBase = dst * 2;
+
+    // 2×2 max with clamped fetches (handles odd source dimensions).
+    ivec2 c00 = clamp(srcBase + ivec2(0,0), ivec2(0), srcSize - 1);
+    ivec2 c10 = clamp(srcBase + ivec2(1,0), ivec2(0), srcSize - 1);
+    ivec2 c01 = clamp(srcBase + ivec2(0,1), ivec2(0), srcSize - 1);
+    ivec2 c11 = clamp(srcBase + ivec2(1,1), ivec2(0), srcSize - 1);
+
+    float d00 = texelFetch(srcMip, c00, 0).r;
+    float d10 = texelFetch(srcMip, c10, 0).r;
+    float d01 = texelFetch(srcMip, c01, 0).r;
+    float d11 = texelFetch(srcMip, c11, 0).r;
+
+    float m = max(max(d00, d10), max(d01, d11));
+    imageStore(dstMip, dst, vec4(m));
+}

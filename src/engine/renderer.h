@@ -14,6 +14,8 @@
 #include "frustum.h"
 #include "instancing.h"
 #include "skeletal.h"
+#include "gpu_cull.h"
+#include "hzb.h"
 
 class ResourceManager;
 
@@ -44,9 +46,14 @@ struct DrawFrameInfo {
 
     UniformBufferObject* ubo;
     CascadeUBO*          cascadeUbo;
-    Frustum*             cameraFrustum;
-    InstanceBuffer*      instances;
+    CullParamsUBO*       cullParams;       // built by engine.cpp every frame
+    CandidateBuffer*     candidates;
+    BatchHeaderBuffer*   batchHeaders;
+    InstanceBuffer*      mainInstances;
+    InstanceBuffer*      shadowInstances;
     IndirectBuffer*      indirect;
+    GpuCullData*         gpuCull;
+    HzbData*             hzb;
 
     // Skeletal animation
     SkinnedMesh*         skinnedMesh        = nullptr;

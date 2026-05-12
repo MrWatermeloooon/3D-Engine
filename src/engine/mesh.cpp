@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <iostream>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
 
 Mesh loadMeshFromObj(const std::string& filepath) {
     tinyobj::attrib_t attrib;
@@ -143,6 +145,79 @@ Mesh createCubeMesh() {
     mesh.aabbMin = { -0.5f, -0.5f, -0.5f };
     mesh.aabbMax = {  0.5f,  0.5f,  0.5f };
 
+    return mesh;
+}
+
+Mesh createIcosphereMesh(uint32_t subdivisions) {
+    // Start from a regular icosahedron (12 verts, 20 faces).
+    const float t = (1.0f + std::sqrt(5.0f)) * 0.5f;
+    std::vector<glm::vec3> positions = {
+        glm::normalize(glm::vec3(-1,  t,  0)),
+        glm::normalize(glm::vec3( 1,  t,  0)),
+        glm::normalize(glm::vec3(-1, -t,  0)),
+        glm::normalize(glm::vec3( 1, -t,  0)),
+        glm::normalize(glm::vec3( 0, -1,  t)),
+        glm::normalize(glm::vec3( 0,  1,  t)),
+        glm::normalize(glm::vec3( 0, -1, -t)),
+        glm::normalize(glm::vec3( 0,  1, -t)),
+        glm::normalize(glm::vec3( t,  0, -1)),
+        glm::normalize(glm::vec3( t,  0,  1)),
+        glm::normalize(glm::vec3(-t,  0, -1)),
+        glm::normalize(glm::vec3(-t,  0,  1)),
+    };
+    std::vector<uint32_t> indices = {
+         0,11, 5,  0, 5, 1,  0, 1, 7,  0, 7,10,  0,10,11,
+         1, 5, 9,  5,11, 4, 11,10, 2, 10, 7, 6,  7, 1, 8,
+         3, 9, 4,  3, 4, 2,  3, 2, 6,  3, 6, 8,  3, 8, 9,
+         4, 9, 5,  2, 4,11,  6, 2,10,  8, 6, 7,  9, 8, 1,
+    };
+
+    // Subdivide. Cache midpoints so each shared edge gets a single new vertex.
+    auto edgeKey = [](uint32_t a, uint32_t b) -> uint64_t {
+        uint64_t lo = std::min(a, b), hi = std::max(a, b);
+        return (hi << 32) | lo;
+    };
+    for (uint32_t s = 0; s < subdivisions; ++s) {
+        std::unordered_map<uint64_t, uint32_t> midCache;
+        std::vector<uint32_t> next;
+        next.reserve(indices.size() * 4);
+        auto midpoint = [&](uint32_t a, uint32_t b) {
+            uint64_t k = edgeKey(a, b);
+            auto it = midCache.find(k);
+            if (it != midCache.end()) return it->second;
+            glm::vec3 m = glm::normalize(positions[a] + positions[b]);
+            uint32_t idx = static_cast<uint32_t>(positions.size());
+            positions.push_back(m);
+            midCache[k] = idx;
+            return idx;
+        };
+        for (size_t i = 0; i < indices.size(); i += 3) {
+            uint32_t a = indices[i], b = indices[i+1], c = indices[i+2];
+            uint32_t ab = midpoint(a, b);
+            uint32_t bc = midpoint(b, c);
+            uint32_t ca = midpoint(c, a);
+            next.insert(next.end(), { a, ab, ca,  b, bc, ab,  c, ca, bc,  ab, bc, ca });
+        }
+        indices = std::move(next);
+    }
+
+    // Build Vertex array. Position == normal for a unit sphere; UV is spherical.
+    Mesh mesh;
+    mesh.vertices.reserve(positions.size());
+    for (const auto& p : positions) {
+        Vertex v{};
+        v.position = p * 0.5f;          // unit-diameter sphere
+        v.normal   = p;
+        v.texCoord = {
+            0.5f + std::atan2(p.z, p.x) / (2.0f * 3.14159265358979323846f),
+            0.5f - std::asin(p.y) / 3.14159265358979323846f
+        };
+        v.color = { 1.0f, 1.0f, 1.0f };
+        mesh.vertices.push_back(v);
+    }
+    mesh.indices = std::move(indices);
+    mesh.aabbMin = { -0.5f, -0.5f, -0.5f };
+    mesh.aabbMax = {  0.5f,  0.5f,  0.5f };
     return mesh;
 }
 

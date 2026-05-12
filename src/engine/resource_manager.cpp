@@ -71,6 +71,12 @@ MeshHandle ResourceManager::addMesh(const std::string& name, Mesh mesh) {
     return handle;
 }
 
+LODGroupHandle ResourceManager::addLODGroup(MeshLODGroup group) {
+    LODGroupHandle h{ static_cast<uint32_t>(m_lodGroups.size()) };
+    m_lodGroups.push_back(std::move(group));
+    return h;
+}
+
 TextureHandle ResourceManager::loadTexture(const std::string& path) {
     auto it = m_textureLookup.find(path);
     if (it != m_textureLookup.end()) return it->second;

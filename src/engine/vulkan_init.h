@@ -50,3 +50,10 @@ inline const std::vector<const char*> VALIDATION_LAYERS = {
 inline const std::vector<const char*> DEVICE_EXTENSIONS = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME
 };
+
+// Variable-rate shading: probed at device creation. If the GPU exposes
+// VK_KHR_fragment_shading_rate AND the pipelineFragmentShadingRate feature,
+// we enable both, light up VRS_SUPPORTED, and load the setter. Otherwise
+// all VRS code paths gracefully no-op.
+extern bool                                  VRS_SUPPORTED;
+extern PFN_vkCmdSetFragmentShadingRateKHR    VRS_SetRate;

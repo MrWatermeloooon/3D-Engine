@@ -1,0 +1,189 @@
+#version 450
+
+// GPU-driven culling: frustum + LOD + (previous-frame) HZB occlusion.
+//
+// Per candidate:
+//   1. Frustum-test against the current camera planes.
+//   2. Project the world-space AABB through the PREVIOUS frame's view-proj,
+//      compute screen-space rect + nearest depth, sample HZB at an
+//      appropriate mip, compare. If AABB-min-depth strictly behind the HZB
+//      max for that region → occluded.
+//   3. LOD-pick by current-frame distance.
+//   4. atomicAdd into the chosen LOD's main draw cmd; unconditionally append
+//      to the shadow draw cmd.
+//
+// Occlusion correctness note: using previous-frame HZB + view-proj is the
+// "single-pass" approximation. It can briefly false-cull objects newly
+// visible after fast camera motion (popping). Acceptable for this engine.
+
+layout(local_size_x = 64) in;
+
+#define MAX_LOD 4
+
+struct InstanceData {
+    mat4 model;          // 64
+    vec4 colorTint;      // 16
+    vec4 matParams;      // 16
+    vec4 normalCol0;     // 16
+    vec4 normalCol1;     // 16
+    vec4 normalCol2;     // 16  → 144 bytes
+};
+
+struct Candidate {
+    InstanceData data;   // 144
+    vec4 aabbMin;        // 16  (xyz = world AABB min, w = batchIndex as float bits)
+    vec4 aabbMax;        // 16
+};
+
+struct BatchHeader {
+    uint  shadowBase;
+    uint  shadowCmd;
+    uint  lodCount;
+    uint  _pad0;
+    uint  lodBase[MAX_LOD];
+    uint  lodCmd[MAX_LOD];
+    float lodDist[MAX_LOD];
+};
+
+struct DrawCmd {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer Candidates {
+    Candidate cand[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer Batches {
+    BatchHeader batches[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer MainInst {
+    InstanceData mainInst[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer ShadowInst {
+    InstanceData shadowInst[];
+};
+layout(set = 0, binding = 4, std430) buffer Indirect {
+    DrawCmd cmds[];
+};
+layout(set = 0, binding = 5, std140) uniform CullParams {
+    mat4 prevViewProj;
+    vec4 frustumPlanes[6];
+    vec4 cameraPos;
+    vec4 hzbSizeMipCount;   // xy = hzb extent, z = mip count, w = enable
+    uint numCandidates;
+    uint _pad0, _pad1, _pad2;
+} params;
+layout(set = 0, binding = 6) uniform sampler2D hzb;
+
+bool aabbInFrustum(vec3 mn, vec3 mx) {
+    for (int i = 0; i < 6; ++i) {
+        vec4 plane = params.frustumPlanes[i];
+        vec3 p;
+        p.x = (plane.x >= 0.0) ? mx.x : mn.x;
+        p.y = (plane.y >= 0.0) ? mx.y : mn.y;
+        p.z = (plane.z >= 0.0) ? mx.z : mn.z;
+        if (dot(plane.xyz, p) + plane.w < 0.0) return false;
+    }
+    return true;
+}
+
+uint pickLod(float distance, BatchHeader B) {
+    uint last = B.lodCount - 1u;
+    for (uint i = 0u; i < B.lodCount; ++i) {
+        if (distance < B.lodDist[i]) return i;
+    }
+    return last;
+}
+
+// Project AABB through the previous frame's view-proj. Compute the
+// screen-space rectangle in [0,1] UVs and the AABB's nearest depth.
+// Returns false if the projection is degenerate (any corner behind the near
+// plane), in which case we conservatively assume "not occluded".
+bool projectAabb(vec3 mn, vec3 mx, out vec2 uvMin, out vec2 uvMax, out float depthMin) {
+    vec3 corners[8] = vec3[8](
+        vec3(mn.x, mn.y, mn.z), vec3(mx.x, mn.y, mn.z),
+        vec3(mn.x, mx.y, mn.z), vec3(mx.x, mx.y, mn.z),
+        vec3(mn.x, mn.y, mx.z), vec3(mx.x, mn.y, mx.z),
+        vec3(mn.x, mx.y, mx.z), vec3(mx.x, mx.y, mx.z)
+    );
+
+    vec3 lo = vec3( 1e30);
+    vec3 hi = vec3(-1e30);
+    for (int i = 0; i < 8; ++i) {
+        vec4 clip = params.prevViewProj * vec4(corners[i], 1.0);
+        if (clip.w <= 0.0) return false;  // behind camera — bail conservatively
+        vec3 ndc = clip.xyz / clip.w;
+        // Vulkan NDC: x,y ∈ [-1,1], z ∈ [0,1]
+        vec3 uvz = vec3(ndc.xy * 0.5 + 0.5, ndc.z);
+        lo = min(lo, uvz);
+        hi = max(hi, uvz);
+    }
+
+    // Reject AABBs that fall fully outside the screen — they're past the
+    // frustum check from prev frame's perspective, which doesn't help us
+    // here. Don't bother HZB-testing; just say "visible" (frustum culling
+    // already filtered current frame).
+    if (hi.x < 0.0 || hi.y < 0.0 || lo.x > 1.0 || lo.y > 1.0) return false;
+
+    uvMin    = clamp(lo.xy, vec2(0.0), vec2(1.0));
+    uvMax    = clamp(hi.xy, vec2(0.0), vec2(1.0));
+    depthMin = clamp(lo.z, 0.0, 1.0);
+    return true;
+}
+
+// Conservative HZB occlusion test. Picks the smallest mip whose texel
+// covers the projected AABB and reads the max depth there.
+bool isOccluded(vec3 mn, vec3 mx) {
+    if (params.hzbSizeMipCount.w < 0.5) return false; // occlusion disabled
+
+    vec2  uvMin; vec2 uvMax; float depthMin;
+    if (!projectAabb(mn, mx, uvMin, uvMax, depthMin)) return false;
+
+    vec2 hzbSize = params.hzbSizeMipCount.xy;
+    int  mipCount = int(params.hzbSizeMipCount.z);
+
+    // Choose a mip such that one HZB texel at that mip covers the projected
+    // rect. Width-in-texels at mip 0 = (uvMax-uvMin) * hzbSize.
+    vec2  rectPx = (uvMax - uvMin) * hzbSize;
+    float maxDim = max(rectPx.x, rectPx.y);
+    int   mip    = clamp(int(ceil(log2(max(maxDim, 1.0)))), 0, mipCount - 1);
+
+    // Sample 2×2 at chosen mip around the rect (more conservative).
+    vec2 mipTexel = 1.0 / max(vec2(1.0), floor(hzbSize / float(1 << mip)));
+    vec2 uvCenter = (uvMin + uvMax) * 0.5;
+    float d00 = textureLod(hzb, uvCenter + mipTexel * vec2(-0.5, -0.5), float(mip)).r;
+    float d10 = textureLod(hzb, uvCenter + mipTexel * vec2( 0.5, -0.5), float(mip)).r;
+    float d01 = textureLod(hzb, uvCenter + mipTexel * vec2(-0.5,  0.5), float(mip)).r;
+    float d11 = textureLod(hzb, uvCenter + mipTexel * vec2( 0.5,  0.5), float(mip)).r;
+    float hzbDepth = max(max(d00, d10), max(d01, d11));
+
+    // AABB closest (min depth) STRICTLY > HZB max → fully behind → occluded.
+    return depthMin > hzbDepth;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= params.numCandidates) return;
+
+    Candidate c   = cand[id];
+    uint batchIdx = floatBitsToUint(c.aabbMin.w);
+    BatchHeader B = batches[batchIdx];
+
+    // Shadow: unconditional (LOD0 mesh). No frustum / occlusion cull.
+    uint shadowSlot = atomicAdd(cmds[B.shadowCmd].instanceCount, 1u);
+    shadowInst[B.shadowBase + shadowSlot] = c.data;
+
+    // Main: frustum, then occlusion, then LOD pick.
+    if (!aabbInFrustum(c.aabbMin.xyz, c.aabbMax.xyz)) return;
+    if (isOccluded(c.aabbMin.xyz, c.aabbMax.xyz))     return;
+
+    vec3 center = 0.5 * (c.aabbMin.xyz + c.aabbMax.xyz);
+    float dist  = length(params.cameraPos.xyz - center);
+    uint  lod   = pickLod(dist, B);
+
+    uint mainSlot = atomicAdd(cmds[B.lodCmd[lod]].instanceCount, 1u);
+    mainInst[B.lodBase[lod] + mainSlot] = c.data;
+}

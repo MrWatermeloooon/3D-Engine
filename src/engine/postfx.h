@@ -116,6 +116,14 @@ struct PostFXSettings {
     // FXAA
     bool  fxaaEnabled = true;
 
+    // Variable rate shading (Phase 4).
+    //   0 = off (always shade at 1×1 — same as no VRS)
+    //   1 = auto / per-LOD (LOD0=1×1, LOD1=2×1, LOD2=2×2, LOD3=4×4)
+    //   2 = forced 2×2
+    //   3 = forced 4×4
+    // Has no effect if the device doesn't support VK_KHR_fragment_shading_rate.
+    int   vrsMode = 1;
+
     // Debug
     int   debugView = 0; // 0=final, 1=HDR, 2=Bloom, 3=SSAO, 5=Lit (no postfx)
 };

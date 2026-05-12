@@ -21,6 +21,12 @@ struct Mesh {
 Mesh loadMeshFromObj(const std::string& filepath);
 Mesh createCubeMesh();
 
+// Procedural unit icosphere. `subdivisions` = 0 yields a 20-tri icosahedron;
+// each step quadruples the triangle count. Useful for generating LOD chains
+// (e.g. subdivisions 3, 2, 1, 0 → 1280, 320, 80, 20 tris). UVs are spherical;
+// the seam is left unfixed (acceptable for untextured / colored demo meshes).
+Mesh createIcosphereMesh(uint32_t subdivisions);
+
 void uploadMesh(Mesh& mesh, VkPhysicalDevice physicalDevice, VkDevice device,
                 VkCommandPool commandPool, VkQueue queue);
 void destroyMesh(VkDevice device, Mesh& mesh);

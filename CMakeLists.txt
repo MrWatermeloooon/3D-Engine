@@ -39,6 +39,8 @@ set(SOURCES
     src/engine/instancing.cpp
     src/engine/skeletal.cpp
     src/engine/jobs.cpp
+    src/engine/gpu_cull.cpp
+    src/engine/hzb.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
@@ -77,6 +79,8 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/ssao.frag
     ${SHADER_SOURCE_DIR}/fxaa.frag
     ${SHADER_SOURCE_DIR}/mesh_skinned.vert
+    ${SHADER_SOURCE_DIR}/cull.comp
+    ${SHADER_SOURCE_DIR}/hzb_reduce.comp
 )
 
 set(SHADER_OUTPUTS "")

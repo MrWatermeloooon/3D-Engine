@@ -19,6 +19,8 @@
 #include "instancing.h"
 #include "skeletal.h"
 #include "jobs.h"
+#include "gpu_cull.h"
+#include "hzb.h"
 
 class Engine {
 public:
@@ -48,8 +50,21 @@ private:
     DebugUI          m_debugUI;
     LightBufferData  m_lightBuffers;
     ShadowData       m_shadow;
-    InstanceBuffer   m_instances;
-    IndirectBuffer   m_indirect;
+    // GPU-driven culling: CPU writes candidates+headers, compute fills the two
+    // instance buffers and the indirect command buffer.
+    CandidateBuffer    m_candidates;
+    BatchHeaderBuffer  m_batchHeaders;
+    InstanceBuffer     m_mainInstances;     // compute writes visible-only
+    InstanceBuffer     m_shadowInstances;   // compute writes all (no cull)
+    IndirectBuffer     m_indirect;
+    GpuCullData        m_gpuCull;
+    HzbData            m_hzb;
+
+    // Previous frame's view-proj — fed to compute cull for HZB-space projection.
+    // Identity on the very first frame; the HZB is cleared to depth=1.0 so
+    // nothing is culled until real data exists.
+    glm::mat4          m_prevViewProj{1.0f};
+    bool               m_hasPrevVP = false;
 
     // Skeletal animation
     SkinnedMesh                  m_skinnedMesh;

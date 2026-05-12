@@ -7,6 +7,7 @@
 
 struct MeshHandle    { uint32_t id = 0; };
 struct TextureHandle { uint32_t id = 0; };
+struct LODGroupHandle { uint32_t id = 0xFFFFFFFFu; }; // sentinel = "no LOD group"
 
 struct TransformComponent {
     glm::vec3 position{0.0f};
@@ -26,6 +27,14 @@ struct TransformComponent {
 
 struct MeshComponent {
     MeshHandle handle;
+};
+
+// Optional override: when present, the renderer uses the LOD group's per-level
+// meshes (selected by view distance in the cull compute shader) instead of
+// MeshComponent.handle. The MeshComponent's handle is still used as the
+// shadow-pass mesh (so silhouettes stay sharp regardless of camera distance).
+struct MeshLODComponent {
+    LODGroupHandle group{};
 };
 
 struct MaterialComponent {

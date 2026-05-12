@@ -54,7 +54,7 @@ void createInstanceBuffer(InstanceBuffer& b, VkPhysicalDevice physicalDevice,
     VkDeviceSize size = static_cast<VkDeviceSize>(capacity) * sizeof(InstanceData);
     for (uint32_t i = 0; i < framesInFlight; ++i) {
         b.buffers[i] = createBuffer(physicalDevice, device, size,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         vkMapMemory(device, b.buffers[i].memory, 0, size, 0, &b.mapped[i]);
     }
@@ -77,13 +77,59 @@ void createIndirectBuffer(IndirectBuffer& b, VkPhysicalDevice physicalDevice,
     VkDeviceSize size = static_cast<VkDeviceSize>(capacity) * sizeof(VkDrawIndexedIndirectCommand);
     for (uint32_t i = 0; i < framesInFlight; ++i) {
         b.buffers[i] = createBuffer(physicalDevice, device, size,
-            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         vkMapMemory(device, b.buffers[i].memory, 0, size, 0, &b.mapped[i]);
     }
 }
 
 void destroyIndirectBuffer(VkDevice device, IndirectBuffer& b) {
+    for (auto& buf : b.buffers) destroyBuffer(device, buf);
+    b.buffers.clear();
+    b.mapped.clear();
+    b.capacity = 0;
+}
+
+void createCandidateBuffer(CandidateBuffer& b, VkPhysicalDevice physicalDevice,
+                           VkDevice device, uint32_t framesInFlight, uint32_t capacity)
+{
+    b.capacity = capacity;
+    b.buffers.resize(framesInFlight);
+    b.mapped.resize(framesInFlight);
+
+    VkDeviceSize size = static_cast<VkDeviceSize>(capacity) * sizeof(CandidateInstance);
+    for (uint32_t i = 0; i < framesInFlight; ++i) {
+        b.buffers[i] = createBuffer(physicalDevice, device, size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkMapMemory(device, b.buffers[i].memory, 0, size, 0, &b.mapped[i]);
+    }
+}
+
+void destroyCandidateBuffer(VkDevice device, CandidateBuffer& b) {
+    for (auto& buf : b.buffers) destroyBuffer(device, buf);
+    b.buffers.clear();
+    b.mapped.clear();
+    b.capacity = 0;
+}
+
+void createBatchHeaderBuffer(BatchHeaderBuffer& b, VkPhysicalDevice physicalDevice,
+                             VkDevice device, uint32_t framesInFlight, uint32_t capacity)
+{
+    b.capacity = capacity;
+    b.buffers.resize(framesInFlight);
+    b.mapped.resize(framesInFlight);
+
+    VkDeviceSize size = static_cast<VkDeviceSize>(capacity) * sizeof(BatchHeader);
+    for (uint32_t i = 0; i < framesInFlight; ++i) {
+        b.buffers[i] = createBuffer(physicalDevice, device, size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkMapMemory(device, b.buffers[i].memory, 0, size, 0, &b.mapped[i]);
+    }
+}
+
+void destroyBatchHeaderBuffer(VkDevice device, BatchHeaderBuffer& b) {
     for (auto& buf : b.buffers) destroyBuffer(device, buf);
     b.buffers.clear();
     b.mapped.clear();

@@ -62,12 +62,40 @@ void Engine::init() {
     // Light buffers
     createLightBuffers(m_lightBuffers, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
 
-    // Instance buffer (capacity 16384 instances per frame — covers 10k+ objects)
-    createInstanceBuffer(m_instances, m_vk.physicalDevice, m_vk.device,
-                         MAX_FRAMES_IN_FLIGHT, 16384);
-    // Indirect buffer: 2 commands per batch (main + shadow), up to 1024 batches per frame.
+    // GPU-driven culling buffers. Main-instance capacity grew because each
+    // batch over-reserves lodCount × instanceCount slots (worst case all
+    // instances pick the same LOD). Indirect grew because each batch now
+    // owns lodCount + 1 cmds (per-LOD main + 1 shadow).
+    constexpr uint32_t MAX_INSTANCES_PER_FRAME = 16384;
+    constexpr uint32_t MAX_BATCHES_PER_FRAME   = 1024;
+    createCandidateBuffer(m_candidates, m_vk.physicalDevice, m_vk.device,
+                          MAX_FRAMES_IN_FLIGHT, MAX_INSTANCES_PER_FRAME);
+    createBatchHeaderBuffer(m_batchHeaders, m_vk.physicalDevice, m_vk.device,
+                            MAX_FRAMES_IN_FLIGHT, MAX_BATCHES_PER_FRAME);
+    createInstanceBuffer(m_mainInstances,   m_vk.physicalDevice, m_vk.device,
+                         MAX_FRAMES_IN_FLIGHT, MAX_INSTANCES_PER_FRAME * MAX_LOD);
+    createInstanceBuffer(m_shadowInstances, m_vk.physicalDevice, m_vk.device,
+                         MAX_FRAMES_IN_FLIGHT, MAX_INSTANCES_PER_FRAME);
     createIndirectBuffer(m_indirect, m_vk.physicalDevice, m_vk.device,
-                         MAX_FRAMES_IN_FLIGHT, 2048);
+                         MAX_FRAMES_IN_FLIGHT, MAX_BATCHES_PER_FRAME * (MAX_LOD + 1));
+
+    // Compute-cull pipeline + per-frame UBO. Pointed at buffers after HZB is
+    // built (cull descriptor set includes the HZB sampler binding).
+    createGpuCull(m_gpuCull, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT,
+                  "shaders/cull.comp.spv");
+
+    // HZB: occlusion-culling pyramid built from the previous frame's depth
+    // attachment. Created after offscreen so depthView/depthSampler exist.
+    createHzb(m_hzb, m_vk.physicalDevice, m_vk.device,
+              m_renderer.commandPool, m_vk.graphicsQueue,
+              m_offscreen.extent,
+              m_offscreen.depthView, m_offscreen.depthSampler,
+              "shaders/hzb_reduce.comp.spv");
+
+    writeGpuCullDescriptors(m_gpuCull, m_vk.device,
+                            m_candidates, m_batchHeaders,
+                            m_mainInstances, m_shadowInstances, m_indirect,
+                            m_hzb.fullView, m_hzb.sampler);
 
     // Descriptor set layouts (scene + material)
     m_descriptors.sceneSetLayout    = createSceneSetLayout(m_vk.device);
@@ -299,8 +327,19 @@ void Engine::run() {
             std::memcpy(m_boneMapped[frame], &palette, sizeof(palette));
         }
 
-        // Build camera frustum for culling
-        Frustum frustum = extractFrustum(proj * ubo.view);
+        // Build camera frustum + CullParamsUBO for the GPU cull dispatch.
+        glm::mat4 currViewProj = proj * ubo.view;
+        Frustum   frustum      = extractFrustum(currViewProj);
+
+        CullParamsUBO cullParams{};
+        cullParams.prevViewProj = m_hasPrevVP ? m_prevViewProj : currViewProj;
+        for (int i = 0; i < 6; ++i) cullParams.frustumPlanes[i] = frustum.planes[i];
+        cullParams.cameraPos        = glm::vec4(m_camera.getPosition(), 1.0f);
+        cullParams.hzbSizeMipCount  = glm::vec4(static_cast<float>(m_hzb.extent.width),
+                                                 static_cast<float>(m_hzb.extent.height),
+                                                 static_cast<float>(m_hzb.mipCount),
+                                                 m_hasPrevVP ? 1.0f : 0.0f);
+        cullParams.numCandidates    = 0;   // set by drawFrame after CPU build pass
 
         DrawFrameInfo info{};
         info.mainPipeline    = m_pipeline.graphicsPipeline;
@@ -318,9 +357,14 @@ void Engine::run() {
         info.settings        = &m_postFXSettings;
         info.ubo             = &ubo;
         info.cascadeUbo      = &cascadeUbo;
-        info.cameraFrustum   = &frustum;
-        info.instances       = &m_instances;
+        info.cullParams      = &cullParams;
+        info.hzb             = &m_hzb;
+        info.candidates      = &m_candidates;
+        info.batchHeaders    = &m_batchHeaders;
+        info.mainInstances   = &m_mainInstances;
+        info.shadowInstances = &m_shadowInstances;
         info.indirect        = &m_indirect;
+        info.gpuCull         = &m_gpuCull;
         info.skinnedMesh     = &m_skinnedMesh;
         info.skinnedPipeline = m_skinnedPipeline.graphicsPipeline;
         info.skinnedLayout   = m_skinnedPipeline.pipelineLayout;
@@ -334,7 +378,14 @@ void Engine::run() {
         bool needsRecreation = drawFrame(m_renderer, m_swapchain, m_vk.device,
                                           m_vk.graphicsQueue, m_vk.presentQueue,
                                           info, m_window->framebufferResized);
-        if (needsRecreation) recreateSwapchain();
+        if (needsRecreation) {
+            recreateSwapchain();
+        } else {
+            // Save this frame's view-proj so the next frame's compute cull can
+            // project AABBs into the HZB the GPU just built.
+            m_prevViewProj = currViewProj;
+            m_hasPrevVP    = true;
+        }
     }
     vkDeviceWaitIdle(m_vk.device);
 }
@@ -352,9 +403,12 @@ void Engine::recreateSwapchain() {
 
     cleanupSwapchain(m_swapchain, m_vk.device);
 
-    // Tear down post-FX (depend on extent + offscreen image views)
+    // Tear down post-FX (depend on extent + offscreen image views). HZB also
+    // depends on the offscreen depthView, so it must be destroyed before
+    // offscreen and rebuilt after.
     destroyPostFXPipelines(m_vk.device, m_postFX);
     destroyLdrTarget(m_vk.device, m_ldr);
+    destroyHzb(m_vk.device, m_hzb);
     destroyOffscreenTarget(m_vk.device, m_offscreen);
     destroyBloomChain(m_vk.device, m_bloom);
     destroySSAO(m_vk.device, m_ssao);
@@ -379,6 +433,21 @@ void Engine::recreateSwapchain() {
                m_swapchain.extent, MAX_FRAMES_IN_FLIGHT);
     createCompositeData(m_composite, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
     createLdrTarget(m_ldr, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
+
+    // Rebuild HZB (depends on offscreen depth + extent) and re-point the cull
+    // descriptor sets at the new HZB views.
+    createHzb(m_hzb, m_vk.physicalDevice, m_vk.device,
+              m_renderer.commandPool, m_vk.graphicsQueue,
+              m_offscreen.extent,
+              m_offscreen.depthView, m_offscreen.depthSampler,
+              "shaders/hzb_reduce.comp.spv");
+    writeGpuCullDescriptors(m_gpuCull, m_vk.device,
+                            m_candidates, m_batchHeaders,
+                            m_mainInstances, m_shadowInstances, m_indirect,
+                            m_hzb.fullView, m_hzb.sampler);
+    // Throw away the previous view-proj — the camera's aspect ratio is about
+    // to change, and an HZB just cleared to 1.0 wouldn't match it anyway.
+    m_hasPrevVP = false;
 
     // Recreate main pipeline (its renderpass and viewport baked from offscreen)
     m_pipeline = createGraphicsPipeline(m_vk.device, m_offscreen.renderPass,
@@ -412,7 +481,12 @@ void Engine::cleanup() {
     for (auto& ub : m_descriptors.uniformBuffers) destroyBuffer(m_vk.device, ub);
 
     destroyLightBuffers(m_vk.device, m_lightBuffers);
-    destroyInstanceBuffer(m_vk.device, m_instances);
+    destroyHzb(m_vk.device, m_hzb);
+    destroyGpuCull(m_vk.device, m_gpuCull);
+    destroyCandidateBuffer(m_vk.device, m_candidates);
+    destroyBatchHeaderBuffer(m_vk.device, m_batchHeaders);
+    destroyInstanceBuffer(m_vk.device, m_mainInstances);
+    destroyInstanceBuffer(m_vk.device, m_shadowInstances);
     destroyIndirectBuffer(m_vk.device, m_indirect);
     destroyShadowResources(m_vk.device, m_shadow);
 

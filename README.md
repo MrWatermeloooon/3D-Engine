@@ -9,8 +9,12 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Mesh-local AABB generation and frustum culling against extracted view-projection planes.
 - Instanced rendering path with per-instance transform, color, metallic, and roughness data.
 - Indirect batched drawing with per-frame `VkDrawIndexedIndirectCommand` buffers.
+- GPU compute culling that writes visible draw commands directly into the indirect buffer.
+- HZB occlusion culling with a compute-built hierarchical depth buffer from the previous frame.
+- Mesh LOD groups with compute-side LOD selection and per-LOD indirect draw slots.
 - Bindless texture array with descriptor indexing and update-after-bind support.
 - Job system with fire-and-forget tasks, blocking `parallel_for`, and frame-work barriers.
+- Variable-rate shading support through `VK_KHR_fragment_shading_rate`, with per-LOD rates and UI override when available.
 - Entity/component scene structure using EnTT.
 - Directional lighting support with cascaded shadow maps.
 - HDR offscreen rendering target.
@@ -29,6 +33,9 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Frustum culling, world AABB generation, model matrix generation, and normal matrix generation are parallelized for larger entity counts.
 - Main and shadow batches now issue indirect indexed draws, setting up the renderer for future compute-driven visibility.
 - Bindless textures are bound once per pass, with each instance selecting its texture by bindless index.
+- CPU-side visible sorting has been replaced by GPU culling: the CPU writes candidate instances and batch headers, then compute fills visible main-pass instances and unconditional shadow instances.
+- The renderer now builds a hierarchical Z buffer after the main pass and uses it for next-frame occlusion culling.
+- LOD spheres and per-LOD indirect commands exercise distance-based mesh selection without changing the graphics draw path.
 
 ## Tech Stack
 
@@ -136,10 +143,9 @@ The repository intentionally ignores local build output, Visual Studio metadata,
 
 ### Performance
 
-- Compute-driven culling: have a compute pass write visible draw commands directly into the indirect buffer.
-- LOD system: swap to lower-poly meshes at distance to keep far objects cheap.
-- Occlusion culling: skip objects hidden behind other geometry.
-- Variable rate shading: shade detailed edges at full rate and flat areas more cheaply.
+- Compute-authored per-cascade shadow visibility so shadow passes can cull per cascade instead of drawing every caster.
+- Attachment-based variable-rate shading: generate a shading-rate image from scene detail or edge detection and migrate the offscreen pass to `VkRenderPass2`.
+- HZB stabilization for fast camera movement to reduce brief false-culls on newly revealed geometry.
 
 ## Hard Addons
 

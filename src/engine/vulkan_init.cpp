@@ -200,6 +200,35 @@ VkPhysicalDevice pickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface) {
 
 // ── Logical device ──────────────────────────────────────────────────────────
 
+bool                                  VRS_SUPPORTED = false;
+PFN_vkCmdSetFragmentShadingRateKHR    VRS_SetRate   = nullptr;
+
+// Returns true if the device exposes VK_KHR_fragment_shading_rate AND the
+// pipelineFragmentShadingRate feature. Attachment-based VRS (texel-rate image)
+// would also need attachmentFragmentShadingRate + a render-pass-2 migration;
+// we deliberately stop at pipeline/dynamic rate to keep render passes simple.
+static bool deviceSupportsVRS(VkPhysicalDevice physicalDevice) {
+    uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> avail(count);
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, avail.data());
+    bool extPresent = false;
+    for (const auto& e : avail) {
+        if (std::string(e.extensionName) == VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) {
+            extPresent = true; break;
+        }
+    }
+    if (!extPresent) return false;
+
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR vrsFeat{};
+    vrsFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+    VkPhysicalDeviceFeatures2 f2{};
+    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    f2.pNext = &vrsFeat;
+    vkGetPhysicalDeviceFeatures2(physicalDevice, &f2);
+    return vrsFeat.pipelineFragmentShadingRate == VK_TRUE;
+}
+
 VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyIndices& indices) {
     std::vector<VkDeviceQueueCreateInfo> queueInfos;
     std::set<uint32_t> uniqueFamilies = {
@@ -227,10 +256,24 @@ VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyI
     vk12.runtimeDescriptorArray                          = VK_TRUE;
     vk12.shaderSampledImageArrayNonUniformIndexing       = VK_TRUE;
 
+    // Optional VRS feature struct, chained only if the device supports it.
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR vrsFeat{};
+    vrsFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+    vrsFeat.pipelineFragmentShadingRate = VK_TRUE;
+
+    const bool vrsSupported = deviceSupportsVRS(physicalDevice);
+
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &vk12;
     features2.features.samplerAnisotropy = VK_TRUE;
+    if (vrsSupported) {
+        vk12.pNext = &vrsFeat;
+    }
+
+    // Build the per-device extension list, copying base + optionally VRS.
+    std::vector<const char*> deviceExts(DEVICE_EXTENSIONS.begin(), DEVICE_EXTENSIONS.end());
+    if (vrsSupported) deviceExts.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -239,8 +282,8 @@ VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyI
     createInfo.pQueueCreateInfos       = queueInfos.data();
     // When using pNext->VkPhysicalDeviceFeatures2, pEnabledFeatures must be null.
     createInfo.pEnabledFeatures        = nullptr;
-    createInfo.enabledExtensionCount   = static_cast<uint32_t>(DEVICE_EXTENSIONS.size());
-    createInfo.ppEnabledExtensionNames = DEVICE_EXTENSIONS.data();
+    createInfo.enabledExtensionCount   = static_cast<uint32_t>(deviceExts.size());
+    createInfo.ppEnabledExtensionNames = deviceExts.data();
 
     // Deprecated but set for older driver compat
     if (ENABLE_VALIDATION_LAYERS) {
@@ -250,6 +293,15 @@ VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyI
 
     VkDevice device;
     VK_CHECK(vkCreateDevice(physicalDevice, &createInfo, nullptr, &device));
-    std::cout << "[VulkanEngine] Logical device created\n";
+
+    VRS_SUPPORTED = vrsSupported;
+    if (VRS_SUPPORTED) {
+        VRS_SetRate = reinterpret_cast<PFN_vkCmdSetFragmentShadingRateKHR>(
+            vkGetDeviceProcAddr(device, "vkCmdSetFragmentShadingRateKHR"));
+        if (!VRS_SetRate) VRS_SUPPORTED = false;  // function load failed somehow
+    }
+    std::cout << "[VulkanEngine] Logical device created"
+              << (VRS_SUPPORTED ? " (VRS supported)" : " (VRS unavailable)")
+              << "\n";
     return device;
 }

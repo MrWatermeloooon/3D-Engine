@@ -4,6 +4,7 @@
 #include "components.h"
 #include "shadow.h"
 #include "postfx.h"
+#include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
 #include <imgui.h>
@@ -290,6 +291,48 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             registry.emplace<MaterialComponent>(e, mat);
             m_selectedEntity = e;
         }
+        // Spawn a 30×30 grid of icosphere instances using a 4-level LOD group
+        // (1280 / 320 / 80 / 20 tris). The LOD group is created on first click
+        // and reused across subsequent clicks. Move the camera to see the
+        // GPU-side LOD selection swap meshes by view distance.
+        if (ImGui::Button("Spawn 900 LOD Spheres")) {
+            static LODGroupHandle s_sphereLOD{};
+            static bool s_sphereLODBuilt = false;
+            if (!s_sphereLODBuilt) {
+                MeshHandle lod0 = resources.addMesh("lod_sphere_0", createIcosphereMesh(3));
+                MeshHandle lod1 = resources.addMesh("lod_sphere_1", createIcosphereMesh(2));
+                MeshHandle lod2 = resources.addMesh("lod_sphere_2", createIcosphereMesh(1));
+                MeshHandle lod3 = resources.addMesh("lod_sphere_3", createIcosphereMesh(0));
+                MeshLODGroup g{};
+                g.levels = {
+                    { lod0, 12.0f },
+                    { lod1, 30.0f },
+                    { lod2, 60.0f },
+                    { lod3, 1.0e30f },
+                };
+                s_sphereLOD = resources.addLODGroup(std::move(g));
+                s_sphereLODBuilt = true;
+            }
+            for (int i = 0; i < 900; ++i) {
+                auto e = registry.create();
+                registry.emplace<NameComponent>(e, std::string("LODSphere"));
+                TransformComponent t{};
+                float x = (float)((i % 30) - 15) * 1.6f;
+                float z = (float)((i / 30) - 15) * 1.6f;
+                t.position = { x, 0.5f, z };
+                t.scale    = { 0.6f, 0.6f, 0.6f };
+                registry.emplace<TransformComponent>(e, t);
+                registry.emplace<MeshComponent>(e, MeshComponent{ /*placeholder*/ resources.getDefaultCube() });
+                registry.emplace<MeshLODComponent>(e, MeshLODComponent{ s_sphereLOD });
+                MaterialComponent mat{};
+                mat.texture   = resources.getDefaultTexture();
+                float h       = (float)i / 900.0f;
+                mat.color     = glm::vec4(0.3f + h * 0.6f, 0.6f, 0.9f - h * 0.4f, 1.0f);
+                mat.metallic  = 0.0f;
+                mat.roughness = 0.45f;
+                registry.emplace<MaterialComponent>(e, mat);
+            }
+        }
         if (ImGui::Button("Spawn 1000 Cubes (instanced demo)")) {
             for (int i = 0; i < 1000; ++i) {
                 auto e = registry.create();
@@ -444,6 +487,15 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
         if (ImGui::CollapsingHeader("Anti-Aliasing", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("FXAA", &postfx.fxaaEnabled);
             ImGui::TextDisabled("Edge-aware luma blur, ~0.2ms at 720p");
+        }
+        if (ImGui::CollapsingHeader("Variable-Rate Shading")) {
+            if (VRS_SUPPORTED) {
+                const char* modes[] = { "Off (1x1)", "Auto / per-LOD", "Forced 2x2", "Forced 4x4" };
+                ImGui::Combo("Mode", &postfx.vrsMode, modes, IM_ARRAYSIZE(modes));
+                ImGui::TextDisabled("Auto: LOD0=1x1, LOD1=2x1, LOD2=2x2, LOD3=4x4");
+            } else {
+                ImGui::TextDisabled("VK_KHR_fragment_shading_rate not supported on this GPU");
+            }
         }
         if (ImGui::CollapsingHeader("Vignette")) {
             ImGui::SliderFloat("Intensity", &postfx.vignetteIntensity, 0.0f, 1.0f);
