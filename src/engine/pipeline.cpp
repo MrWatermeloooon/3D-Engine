@@ -109,11 +109,13 @@ PipelineData createGraphicsPipeline(VkDevice device, VkRenderPass renderPass, Vk
     depthStencil.depthCompareOp   = VK_COMPARE_OP_LESS;
 
     // Two color attachments now: HDR color + motion vectors. Both use the
-    // standard "write all components, no blending" state.
+    // standard "write all components, no blending" state. Identical state
+    // across attachments is required without VkPhysicalDeviceFeatures::independentBlend
+    // — and RGBA mask bits for components missing from RG16F are ignored.
     VkPipelineColorBlendAttachmentState blendAttachments[2]{};
     blendAttachments[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
                                        | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    blendAttachments[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+    blendAttachments[1] = blendAttachments[0];
 
     VkPipelineColorBlendStateCreateInfo colorBlending{};
     colorBlending.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -338,11 +340,12 @@ PipelineData createSkinnedPipeline(VkDevice device, VkRenderPass renderPass, VkE
     ds.depthCompareOp   = VK_COMPARE_OP_LESS;
 
     // Skinned pipeline shares the main offscreen render pass which now has
-    // 2 color attachments (color + motion). Mirror the blend states.
+    // 2 color attachments (color + motion). Both blend states must be
+    // identical (no independentBlend feature enabled).
     VkPipelineColorBlendAttachmentState blends[2]{};
     blends[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
                              | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    blends[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+    blends[1] = blends[0];
 
     VkPipelineColorBlendStateCreateInfo cb{};
     cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;

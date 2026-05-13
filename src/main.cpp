@@ -4,6 +4,10 @@
 #include <stdexcept>
 
 int main() {
+    // Unbuffered stdout so that taskkill-style aborts during dev still leave
+    // a readable log. Cheap; no perf concern for a per-frame engine.
+    std::cout.setf(std::ios::unitbuf);
+    std::cerr.setf(std::ios::unitbuf);
     Engine engine;
 
     try {

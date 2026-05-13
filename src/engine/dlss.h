@@ -29,7 +29,7 @@ enum class DlssQuality : int {
 // `quality` chooses the render-resolution multiplier (DLAA = 1.0, Quality =
 // 0.667, Balanced = 0.58, Performance = 0.5, UltraPerformance = 0.333).
 struct DlssSettings {
-    bool        enabled = false;          // off by default until upscale is wired in 4c
+    bool        enabled = false;          // user toggles via the DLSS panel
     DlssQuality quality = DlssQuality::Quality;
     bool        jitterEnabled = true;     // sub-pixel jitter on the camera proj
 };
@@ -60,6 +60,71 @@ void dlssInit(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice dev
 
 // True iff the runtime is alive and reported a hardware DLSS capability.
 bool dlssAvailable();
+
+// Query NGX for the optimal *input* render size given a final upscale target
+// (typically the swapchain extent) and quality preset. Returns (inWidth,
+// inHeight) on success. On failure, returns (targetW, targetH) so callers can
+// always render at native if NGX rejects the combo. DLAA always returns
+// target = input.
+//
+// Must be called after dlssInit returned successfully.
+struct DlssRenderSize {
+    uint32_t inWidth;
+    uint32_t inHeight;
+    bool     ok;        // false → quality not supported at this target size
+};
+DlssRenderSize dlssGetOptimalRenderSize(uint32_t targetWidth,
+                                        uint32_t targetHeight,
+                                        DlssQuality quality);
+
+// Create the DLSS feature for the given (input, target) pair + quality.
+// Records an internal feature handle; subsequent calls to dlssEvaluate use it.
+// The create call records GPU work on `cmd` (DLSS needs to upload weights),
+// so callers must submit `cmd` and wait/idle before destroying the cmd buffer.
+// Releases any previously-created feature first — safe to call repeatedly.
+bool dlssCreateFeature(VkCommandBuffer cmd,
+                       uint32_t inWidth,  uint32_t inHeight,
+                       uint32_t outWidth, uint32_t outHeight,
+                       DlssQuality quality);
+
+// Destroy the active DLSS feature. Waits for the device first — callers must
+// not have any in-flight frames referencing it. Safe to call when no feature
+// is active.
+void dlssReleaseFeature(VkDevice device);
+
+// True iff a DLSS feature has been created and is ready to evaluate.
+bool dlssFeatureReady();
+
+// Inputs/outputs the active feature was created with. {0,0} if none.
+VkExtent2D dlssFeatureInputExtent();
+VkExtent2D dlssFeatureOutputExtent();
+
+// Record a DLSS evaluate into `cmd`. All resources must already be in the
+// expected layouts:
+//   - colorView, depthView, motionView in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+//   - outputView                       in VK_IMAGE_LAYOUT_GENERAL
+// The caller is responsible for barriers before and after this call.
+//
+// jitterX/Y are in *input pixel* space (the same value the engine applied to
+// the camera projection, multiplied by inputExtent / 2.0 from NDC).
+//
+// motionScaleX/Y let NGX convert motion vectors to input-pixel units. Our
+// mesh.frag writes NDC-space (prev - curr); to get input-pixel deltas we need
+// MV * (inWidth/2, inHeight/2) — but with a sign flip on Y because Vulkan
+// NDC y points down vs. DLSS' input-pixel y. Caller passes the final scales.
+//
+// reset=true on the first frame after feature creation, scene cut, or any
+// camera teleport, to flush DLSS' history buffer.
+void dlssEvaluate(VkCommandBuffer cmd,
+                  VkImage colorImage,  VkImageView colorView,  VkFormat colorFormat,
+                  VkImage depthImage,  VkImageView depthView,  VkFormat depthFormat,
+                  VkImage motionImage, VkImageView motionView, VkFormat motionFormat,
+                  VkImage outputImage, VkImageView outputView, VkFormat outputFormat,
+                  uint32_t inWidth, uint32_t inHeight,
+                  uint32_t outWidth, uint32_t outHeight,
+                  float jitterX, float jitterY,
+                  float motionScaleX, float motionScaleY,
+                  bool reset);
 
 // Release NGX. Safe to call even if init failed or never ran.
 void dlssShutdown(VkDevice device);

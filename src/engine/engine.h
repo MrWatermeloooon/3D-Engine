@@ -39,6 +39,17 @@ private:
     void recreateSwapchain();
     void processInput(double deltaTime);
 
+    // Pick the offscreen render extent — m_swapchain.extent when DLSS is off,
+    // the NGX-reported optimal input size when on. Stores into m_renderExtent.
+    // If DLSS is on but NGX fails, falls back to native and forces dlssEnabled
+    // off so callers don't try to create a feature.
+    void computeRenderExtent();
+
+    // After the offscreen/upscale targets exist and m_renderExtent matches the
+    // user's wanted DLSS state, (re)build the NGX feature. Submits a one-shot
+    // command buffer (NGX records init work into it). Updates m_dlssActive*.
+    void rebuildDlssFeatureIfNeeded();
+
     Window*          m_window = nullptr;
     VulkanContext    m_vk{};
     SwapchainData    m_swapchain{};
@@ -73,6 +84,22 @@ private:
     DlssSettings       m_dlssSettings{};
     uint32_t           m_haltonIndex = 1;
     glm::mat4          m_dlssPrevViewProj{1.0f};
+
+    // Effective offscreen render resolution. Equal to m_swapchain.extent when
+    // DLSS is off; the optimal-input size reported by NGX when DLSS is on.
+    VkExtent2D         m_renderExtent{0, 0};
+
+    // Tracks the (enabled, quality) snapshot the current DLSS feature was
+    // created for. Differs from m_dlssSettings → trigger a recreate at the
+    // top of the next frame.
+    bool               m_dlssActiveEnabled = false;
+    DlssQuality        m_dlssActiveQuality = DlssQuality::Off;
+    bool               m_dlssResetHistory  = true;
+
+    // Full-res target that DLSS writes its upscaled output into. Resides at
+    // m_swapchain.extent. FXAA samples from here when the active DLSS
+    // feature is alive.
+    UpscaleTarget      m_upscale;
 
 public:
     RtSettings&   rtSettings()   { return m_rtSettings; }

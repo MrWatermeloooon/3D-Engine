@@ -42,8 +42,17 @@ struct DrawFrameInfo {
     SSAOTarget*      ssao;
     CompositeData*   composite;
     LdrTarget*       ldr;
+    UpscaleTarget*   upscale = nullptr;   // optional — only used when DLSS is on
     PostFXPipelines* postfx;
     PostFXSettings*  settings;
+
+    // DLSS evaluate parameters. Renderer issues NGX evaluate when
+    // dlssActive == true and the global feature is ready. Jitter is in input
+    // pixel space (matches camera jitter the engine applied this frame).
+    bool             dlssActive       = false;
+    float            dlssJitterX      = 0.0f;
+    float            dlssJitterY      = 0.0f;
+    bool             dlssResetHistory = false;
 
     UniformBufferObject* ubo;
     CascadeUBO*          cascadeUbo;

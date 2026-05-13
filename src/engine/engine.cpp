@@ -62,21 +62,29 @@ void Engine::init() {
     // Pick depth format for offscreen
     m_depthFormat = findDepthFormat(m_vk.physicalDevice);
 
+    // Render extent — equal to swapchain extent on first init (DLSS starts off).
+    // computeRenderExtent() is the authoritative source after this.
+    computeRenderExtent();
+
     // Offscreen HDR target (main pass → here)
     createOffscreenTarget(m_offscreen, m_vk.physicalDevice, m_vk.device,
-                          m_swapchain.extent, m_depthFormat);
+                          m_renderExtent, m_depthFormat);
 
     // Bloom chain
-    createBloomChain(m_bloom, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
+    createBloomChain(m_bloom, m_vk.physicalDevice, m_vk.device, m_renderExtent);
 
     // SSAO
     createSSAO(m_ssao, m_vk.physicalDevice, m_vk.device,
                m_renderer.commandPool, m_vk.graphicsQueue,
-               m_swapchain.extent, MAX_FRAMES_IN_FLIGHT);
+               m_renderExtent, MAX_FRAMES_IN_FLIGHT);
 
     // Composite + LDR (composite writes here, FXAA reads from here)
     createCompositeData(m_composite, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
-    createLdrTarget(m_ldr, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
+    createLdrTarget(m_ldr, m_vk.physicalDevice, m_vk.device, m_renderExtent);
+
+    // DLSS upscale target. Always at full swapchain extent. FXAA samples
+    // from here whenever a DLSS feature is alive.
+    createUpscaleTarget(m_upscale, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
 
     // Shadow
     createShadowResources(m_shadow, m_vk.physicalDevice, m_vk.device,
@@ -130,6 +138,27 @@ void Engine::init() {
                             m_candidates, m_batchHeaders,
                             m_mainInstances, m_shadowInstances, m_indirect,
                             m_hzb.fullView, m_hzb.sampler);
+
+    // Move the upscale image into the layout FXAA expects when DLSS is off
+    // (we still bind its descriptor to FXAA via createPostFXPipelines below,
+    // so even a never-touched upscale image gets sampled — must not be
+    // UNDEFINED). One-time transition via a one-shot command buffer.
+    {
+        VkCommandBuffer one = beginSingleTimeCommands(m_vk.device, m_renderer.commandPool);
+        VkImageMemoryBarrier b{};
+        b.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask    = 0;
+        b.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
+        b.image            = m_upscale.image.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(one, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        endSingleTimeCommands(m_vk.device, m_renderer.commandPool,
+                               m_vk.graphicsQueue, one);
+        m_upscale.wasInitialised = true;
+    }
 
     // Ray tracing scaffolding. Phase 1a: just sizes per-frame containers.
     // No BLAS/TLAS exist yet — those come in Phase 1b.
@@ -225,14 +254,18 @@ void Engine::init() {
 
     // Post-FX pipelines + descriptor sets
     createPostFXPipelines(m_postFX, m_vk.device, m_bloom, m_ssao, m_composite, m_ldr,
-                          m_offscreen, m_swapchain.renderPass, MAX_FRAMES_IN_FLIGHT);
+                          m_offscreen, m_swapchain.renderPass, MAX_FRAMES_IN_FLIGHT,
+                          &m_upscale);
 
     allocateCommandBuffers(m_renderer, m_vk.device);
 
     m_scene.createDefaultScene(m_resources);
 
-    m_camera.setAspectRatio(static_cast<float>(m_swapchain.extent.width) /
-                            static_cast<float>(m_swapchain.extent.height));
+    // Aspect ratio drives camera projection. Use the render extent so that
+    // when DLSS is toggled and the offscreen is sized smaller, the camera
+    // proj matches — DLSS optimal sizes preserve aspect, but be defensive.
+    m_camera.setAspectRatio(static_cast<float>(m_renderExtent.width) /
+                            static_cast<float>(m_renderExtent.height));
 
     m_debugUI.init(m_window->getHandle(), m_vk.instance, m_vk.physicalDevice,
                    m_vk.device, m_vk.queueFamilies.graphicsFamily.value(),
@@ -339,20 +372,42 @@ void Engine::run() {
         ubo.proj      = m_camera.getProjectionMatrix();
         ubo.cameraPos = glm::vec4(m_camera.getPosition(), 1.0f);
 
+        // If the user toggled DLSS or changed quality through the UI, we have
+        // to recreate the offscreen/upscale resources at the new extent. The
+        // simplest way to fold this into the existing path is to detect a
+        // mismatch and route through recreateSwapchain — which already
+        // tears down + rebuilds everything keyed on extent, including the
+        // DLSS feature.
+        const bool wantDlss = m_dlssSettings.enabled && dlssAvailable();
+        if (wantDlss != m_dlssActiveEnabled ||
+            (wantDlss && m_dlssSettings.quality != m_dlssActiveQuality))
+        {
+            recreateSwapchain();
+            // After recreate, m_renderExtent reflects the new state and the
+            // DLSS feature is gone — rebuild it now (before any draw uses it).
+            rebuildDlssFeatureIfNeeded();
+            // Skip the rest of this frame to avoid feeding the just-built
+            // feature a frame from before the recreate.
+            continue;
+        }
+
         // DLSS sub-pixel jitter — applied directly to the projection matrix.
         // For column-major GLM, proj[2][0] / proj[2][1] are the X / Y
         // translation entries of clip space. Adding `j * 2 / extent` shifts
         // every vertex by exactly `j` pixels in screen space (NDC is [-1,1]
-        // across the full extent). Jitter is gated by DLSS enable so it's
-        // invisible until you toggle DLSS on.
+        // across the full extent). Jitter is sized by the *render* extent
+        // (DLSS' input resolution) — that's the pixel grid the rasteriser is
+        // actually sampling, and what NGX wants jitter expressed in.
         glm::vec2 jitterNDC(0.0f);
+        glm::vec2 jitterPixels(0.0f);
         if (m_dlssSettings.enabled && m_dlssSettings.jitterEnabled) {
             glm::vec2 j = haltonJitter(m_haltonIndex);
             m_haltonIndex = (m_haltonIndex % 8u) + 1u; // 8-frame cycle
-            jitterNDC = glm::vec2(j.x * 2.0f / float(m_swapchain.extent.width),
-                                  j.y * 2.0f / float(m_swapchain.extent.height));
+            jitterNDC = glm::vec2(j.x * 2.0f / float(m_renderExtent.width),
+                                  j.y * 2.0f / float(m_renderExtent.height));
             ubo.proj[2][0] += jitterNDC.x;
             ubo.proj[2][1] += jitterNDC.y;
+            jitterPixels = j; // Halton outputs in pixel-space [-0.5, +0.5]
         }
         ubo.jitterOffset = glm::vec4(jitterNDC, 0.0f, 0.0f);
         ubo.prevViewProj = m_dlssPrevViewProj;
@@ -389,7 +444,7 @@ void Engine::run() {
 
         glm::mat4 proj    = m_camera.getProjectionMatrix();
         glm::mat4 invProj = glm::inverse(proj);
-        updateSSAOUbo(m_ssao, frame, proj, invProj, m_swapchain.extent, effectiveFx);
+        updateSSAOUbo(m_ssao, frame, proj, invProj, m_renderExtent, effectiveFx);
         updateCompositeUbo(m_composite, frame, effectiveFx);
 
         // Advance animators and update bone palette UBO for this frame
@@ -438,8 +493,14 @@ void Engine::run() {
         info.ssao            = &m_ssao;
         info.composite       = &m_composite;
         info.ldr             = &m_ldr;
+        info.upscale         = &m_upscale;
         info.postfx          = &m_postFX;
         info.settings        = &m_postFXSettings;
+        info.dlssActive      = m_dlssActiveEnabled && dlssFeatureReady();
+        info.dlssJitterX     = jitterPixels.x;
+        info.dlssJitterY     = jitterPixels.y;
+        info.dlssResetHistory = m_dlssResetHistory;
+        if (m_dlssResetHistory) m_dlssResetHistory = false;
         info.ubo             = &ubo;
         info.cascadeUbo      = &cascadeUbo;
         info.cullParams      = &cullParams;
@@ -468,6 +529,11 @@ void Engine::run() {
                                           info, m_window->framebufferResized);
         if (needsRecreation) {
             recreateSwapchain();
+            // recreate cleared the DLSS feature; if the user has DLSS on,
+            // build a new one for the new swapchain size now (otherwise the
+            // next-frame mismatch detection would just recreate everything
+            // again).
+            rebuildDlssFeatureIfNeeded();
         } else {
             // Save this frame's view-proj so the next frame's compute cull can
             // project AABBs into the HZB the GPU just built.
@@ -494,6 +560,12 @@ void Engine::recreateSwapchain() {
 
     vkDeviceWaitIdle(m_vk.device);
 
+    // Tear down the DLSS feature before anything that backs its inputs goes
+    // away (offscreen/ldr) — NGX captures internal references at create time.
+    dlssReleaseFeature(m_vk.device);
+    m_dlssActiveEnabled = false;
+    m_dlssActiveQuality = DlssQuality::Off;
+
     cleanupSwapchain(m_swapchain, m_vk.device);
 
     // Tear down post-FX (depend on extent + offscreen image views). HZB also
@@ -501,6 +573,7 @@ void Engine::recreateSwapchain() {
     // offscreen and rebuilt after.
     destroyPostFXPipelines(m_vk.device, m_postFX);
     destroyLdrTarget(m_vk.device, m_ldr);
+    destroyUpscaleTarget(m_vk.device, m_upscale);
     destroyHzb(m_vk.device, m_hzb);
     destroyOffscreenTarget(m_vk.device, m_offscreen);
     destroyBloomChain(m_vk.device, m_bloom);
@@ -517,15 +590,22 @@ void Engine::recreateSwapchain() {
     createFramebuffers(m_swapchain, m_vk.device);
     createPresentSemaphores(m_swapchain, m_vk.device);
 
-    // Recreate offscreen + bloom + ssao + composite + ldr
+    // Recompute the offscreen render extent now that the swapchain size is
+    // known. This is also where DLSS quality changes get picked up — the
+    // user's choice in m_dlssSettings drives the result.
+    computeRenderExtent();
+
+    // Recreate offscreen + bloom + ssao + composite + ldr at the chosen
+    // render extent. The upscale target always tracks the swapchain.
     createOffscreenTarget(m_offscreen, m_vk.physicalDevice, m_vk.device,
-                          m_swapchain.extent, m_depthFormat);
-    createBloomChain(m_bloom, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
+                          m_renderExtent, m_depthFormat);
+    createBloomChain(m_bloom, m_vk.physicalDevice, m_vk.device, m_renderExtent);
     createSSAO(m_ssao, m_vk.physicalDevice, m_vk.device,
                m_renderer.commandPool, m_vk.graphicsQueue,
-               m_swapchain.extent, MAX_FRAMES_IN_FLIGHT);
+               m_renderExtent, MAX_FRAMES_IN_FLIGHT);
     createCompositeData(m_composite, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
-    createLdrTarget(m_ldr, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
+    createLdrTarget(m_ldr, m_vk.physicalDevice, m_vk.device, m_renderExtent);
+    createUpscaleTarget(m_upscale, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
 
     // Rebuild HZB (depends on offscreen depth + extent) and re-point the cull
     // descriptor sets at the new HZB views. Half-extent — see note at the
@@ -555,10 +635,88 @@ void Engine::recreateSwapchain() {
 
     // Recreate post-FX pipelines + descriptor sets
     createPostFXPipelines(m_postFX, m_vk.device, m_bloom, m_ssao, m_composite, m_ldr,
-                          m_offscreen, m_swapchain.renderPass, MAX_FRAMES_IN_FLIGHT);
+                          m_offscreen, m_swapchain.renderPass, MAX_FRAMES_IN_FLIGHT,
+                          &m_upscale);
 
-    m_camera.setAspectRatio(static_cast<float>(m_swapchain.extent.width) /
-                            static_cast<float>(m_swapchain.extent.height));
+    // Transition the brand-new upscale image to SHADER_READ_ONLY so its
+    // descriptor is valid even before DLSS evaluates into it for the first
+    // time. Mirrors the init-time transition.
+    {
+        VkCommandBuffer one = beginSingleTimeCommands(m_vk.device, m_renderer.commandPool);
+        VkImageMemoryBarrier b{};
+        b.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask    = 0;
+        b.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
+        b.image            = m_upscale.image.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(one, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        endSingleTimeCommands(m_vk.device, m_renderer.commandPool,
+                               m_vk.graphicsQueue, one);
+        m_upscale.wasInitialised = true;
+    }
+
+    m_camera.setAspectRatio(static_cast<float>(m_renderExtent.width) /
+                            static_cast<float>(m_renderExtent.height));
+
+    // Force a DLSS history flush on the first frame after a recreate.
+    m_dlssResetHistory = true;
+}
+
+// ── Render extent (DLSS-aware) + DLSS feature lifecycle ────────────────────
+
+void Engine::computeRenderExtent() {
+    if (m_dlssSettings.enabled && dlssAvailable()) {
+        DlssRenderSize rs = dlssGetOptimalRenderSize(
+            m_swapchain.extent.width, m_swapchain.extent.height, m_dlssSettings.quality);
+        if (rs.ok) {
+            m_renderExtent = { rs.inWidth, rs.inHeight };
+            return;
+        }
+        // NGX rejected the quality at this size — fall back gracefully.
+        std::cerr << "[DLSS] Optimal render size unavailable — disabling DLSS for this session.\n";
+        m_dlssSettings.enabled = false;
+    }
+    m_renderExtent = m_swapchain.extent;
+}
+
+void Engine::rebuildDlssFeatureIfNeeded() {
+    // Nothing to do when the desired state already matches the active one.
+    const bool wantDlss = m_dlssSettings.enabled && dlssAvailable();
+    if (wantDlss == m_dlssActiveEnabled &&
+        m_dlssSettings.quality == m_dlssActiveQuality)
+    {
+        return;
+    }
+
+    // Release any existing feature. Safe when none is alive.
+    dlssReleaseFeature(m_vk.device);
+    m_dlssActiveEnabled = false;
+    m_dlssActiveQuality = DlssQuality::Off;
+    m_dlssResetHistory  = true;  // history is meaningless after a recreate
+
+    if (!wantDlss) return;
+
+    // NGX needs the create call to be on a command buffer it can submit
+    // synchronously. Use a one-shot.
+    VkCommandBuffer one = beginSingleTimeCommands(m_vk.device, m_renderer.commandPool);
+    bool ok = dlssCreateFeature(one,
+                                m_renderExtent.width,    m_renderExtent.height,
+                                m_swapchain.extent.width, m_swapchain.extent.height,
+                                m_dlssSettings.quality);
+    endSingleTimeCommands(m_vk.device, m_renderer.commandPool,
+                           m_vk.graphicsQueue, one);
+
+    if (ok && dlssFeatureReady()) {
+        m_dlssActiveEnabled = true;
+        m_dlssActiveQuality = m_dlssSettings.quality;
+    } else {
+        // Disable user-facing toggle so the renderer doesn't keep retrying
+        // and so the UI reflects reality.
+        m_dlssSettings.enabled = false;
+    }
 }
 
 // ── Cleanup ─────────────────────────────────────────────────────────────────
@@ -570,6 +728,7 @@ void Engine::cleanup() {
 
     destroyPostFXPipelines(m_vk.device, m_postFX);
     destroyLdrTarget(m_vk.device, m_ldr);
+    destroyUpscaleTarget(m_vk.device, m_upscale);
     destroyCompositeData(m_vk.device, m_composite);
     destroySSAO(m_vk.device, m_ssao);
     destroyBloomChain(m_vk.device, m_bloom);

@@ -7,6 +7,7 @@
 #include "jobs.h"
 #include "gpu_cull.h"
 #include "vulkan_init.h"
+#include "dlss.h"
 #include "../utils/vk_check.h"
 
 #include <imgui.h>
@@ -723,9 +724,79 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
                         info.postfx->composite, info.postfx->compositeLayout,
                         info.composite->descriptorSets[frame]);
 
-    recordFxaaPass(cmd, swapchain, *info.ldr,
+    // ── DLSS evaluate (replaces the implicit "blit LDR → swapchain") ───────
+    // Runs only when a DLSS feature is alive. Consumes the freshly-composited
+    // LDR image plus the depth & motion targets from this frame's main pass
+    // and writes the upscaled output that FXAA will sample below.
+    VkDescriptorSet fxaaInputSet = info.ldr->descriptorSet;
+    VkExtent2D      fxaaSrcExtent = info.ldr->extent;
+    if (info.dlssActive && info.upscale && info.upscale->image.image) {
+        // Layout flips:
+        //   upscale: SHADER_READ_ONLY → GENERAL (NGX writes via storage image)
+        // LDR/motion are already in SHADER_READ_ONLY (composite + offscreen
+        // final layouts). Depth is in DEPTH_STENCIL_READ_ONLY_OPTIMAL which
+        // is shader-sampleable for the depth aspect — NGX accepts it.
+        VkImageMemoryBarrier toGeneral{};
+        toGeneral.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toGeneral.oldLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        toGeneral.newLayout        = VK_IMAGE_LAYOUT_GENERAL;
+        toGeneral.srcAccessMask    = VK_ACCESS_SHADER_READ_BIT;
+        toGeneral.dstAccessMask    = VK_ACCESS_SHADER_WRITE_BIT
+                                   | VK_ACCESS_SHADER_READ_BIT;
+        toGeneral.image            = info.upscale->image.image;
+        toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+
+        // NDC motion was written as (prev - curr) with no per-axis sign flip;
+        // for DLSS, MVScale = (inW/2, inH/2) converts NDC delta to input
+        // pixels, with a Y flip because Vulkan NDC y points down (DLSS pixel
+        // y points down too — actually no flip needed for Vulkan; the engine
+        // already encodes motion in NDC where +Y is down, matching pixel y).
+        const float mvScaleX = 0.5f * float(info.offscreen->extent.width);
+        const float mvScaleY = 0.5f * float(info.offscreen->extent.height);
+
+        dlssEvaluate(cmd,
+                     info.ldr->image.image,      info.ldr->view,       info.ldr->format,
+                     info.offscreen->depthImage.image, info.offscreen->depthView,
+                                                 info.offscreen->depthFormat,
+                     info.offscreen->motionImage.image, info.offscreen->motionView,
+                                                 info.offscreen->motionFormat,
+                     info.upscale->image.image,  info.upscale->view,   info.upscale->format,
+                     info.offscreen->extent.width, info.offscreen->extent.height,
+                     info.upscale->extent.width,   info.upscale->extent.height,
+                     info.dlssJitterX, info.dlssJitterY,
+                     mvScaleX, mvScaleY,
+                     info.dlssResetHistory);
+
+        VkImageMemoryBarrier toRead{};
+        toRead.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toRead.oldLayout        = VK_IMAGE_LAYOUT_GENERAL;
+        toRead.newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        toRead.srcAccessMask    = VK_ACCESS_SHADER_WRITE_BIT;
+        toRead.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
+        toRead.image            = info.upscale->image.image;
+        toRead.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toRead);
+
+        fxaaInputSet  = info.upscale->descriptorSet;
+        fxaaSrcExtent = info.upscale->extent;
+    }
+
+    // FXAA's push-constant texelSize comes from whichever target it samples.
+    // We reuse recordFxaaPass but pass a synthetic LdrTarget-shaped wrapper
+    // through its `ldr.extent` argument; the simplest way is to stuff the
+    // chosen extent into a local copy.
+    LdrTarget fxaaSrc = *info.ldr;
+    fxaaSrc.extent = fxaaSrcExtent;
+    recordFxaaPass(cmd, swapchain, fxaaSrc,
                    info.postfx->fxaa, info.postfx->fxaaLayout,
-                   info.ldr->descriptorSet, imageIndex, info.settings->fxaaEnabled);
+                   fxaaInputSet, imageIndex, info.settings->fxaaEnabled);
 
     VK_CHECK(vkEndCommandBuffer(cmd));
 

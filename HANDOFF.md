@@ -261,9 +261,21 @@ is valid even when the shadow pass never runs (RT-shadows-only case).
 - `mesh.frag` writes `(prevNDC - currNDC)` to attachment 1, with the jitter
   offset subtracted from `currNDC` so motion encodes only real motion.
 
-**Step 4c (TODO).** Wire up `NVSDK_NGX_VULKAN_CreateFeature_DLSS` +
-`NVSDK_NGX_VULKAN_EvaluateFeature`, render at lower offscreen extent per
-quality preset, route FXAA input from the DLSS output when on.
+**Step 4c (complete).** `dlssCreateFeature` / `dlssEvaluate` /
+`dlssGetOptimalRenderSize` / `dlssReleaseFeature` wrap the NGX entry points.
+`Engine::computeRenderExtent` picks the offscreen extent: full swapchain
+extent when DLSS is off, NGX-reported optimal input size when on. Offscreen,
+bloom, SSAO, composite, LDR, and HZB are all built at this `m_renderExtent`;
+only the new `UpscaleTarget m_upscale` and the swapchain itself live at full
+resolution. Toggling DLSS / changing the quality preset is detected at the
+top of each frame, triggering `recreateSwapchain()` + `rebuildDlssFeatureIfNeeded()`
+in one shot. The renderer inserts a DLSS evaluate between composite and FXAA
+when a feature is alive: LDR (low-res, SHADER_READ_ONLY) → upscale (full-res,
+GENERAL→SHADER_READ_ONLY), with motion + depth fed from the offscreen pass.
+FXAA samples from `m_upscale.descriptorSet` instead of `m_ldr.descriptorSet`
+when DLSS is active. Camera jitter is computed against `m_renderExtent`
+(input pixels), and the same Halton offset is forwarded to NGX as
+`InJitterOffsetX/Y` in input-pixel space.
 
 ### Post-FX
 
@@ -380,21 +392,22 @@ Sun + warm fill point light + steel/red/gold spinning cubes + floor.
 
 ## Known issues / deferred work
 
-### DLSS upscale not wired (Phase 4c)
+### DLSS upscale runs at LDR (post-tonemap), not HDR
 
-Motion vectors are produced and the NGX runtime is initialised, but
-`NVSDK_NGX_VULKAN_CreateFeature_DLSS` / `EvaluateFeature` are not called
-yet, and the offscreen target still renders at full swapchain resolution.
-To finish:
-1. Add `dlssCreateFeature(width, height, quality)` →
-   `NVSDK_NGX_VULKAN_CreateFeature_DLSS`.
-2. Add `dlssEvaluate(cmd, color, depth, motion, output, jitter)` →
-   `NVSDK_NGX_VULKAN_EvaluateFeature`.
-3. Recreate offscreen + LDR at the lower render-scale resolution when
-   DLSS toggles. Existing extent-dependent rebuild logic in
-   `Engine::recreateSwapchain` is the template.
-4. Insert a DLSS pass after the LDR composite, output to a new full-res
-   image, route FXAA input from that image when DLSS is on.
+The current placement (per the original handoff plan) feeds DLSS a
+tonemapped, gamma-corrected LDR image from the composite pass — not the
+canonical HDR pre-composite input NVIDIA recommends. This loses some
+quality (DLSS' internal exposure heuristics and temporal accumulation are
+tuned for HDR linear input) but keeps the pipeline simple: a single
+DLSS pass slots in cleanly between composite and FXAA, and bloom/SSAO/
+composite all run unchanged at the low render extent.
+
+To switch to HDR DLSS: move the DLSS pass to run between the main pass
+and SSAO/bloom, write its output into a full-res HDR image, and rebuild
+the bloom/SSAO/composite chain at full resolution off that image (or
+keep them at low res and accept the bandwidth — common). The
+`NVSDK_NGX_DLSS_Feature_Flags_IsHDR` create flag needs to be set in
+`dlssCreateFeature` too.
 
 ### Per-instance previous transform not tracked
 
@@ -500,8 +513,10 @@ it in `mesh.frag::main`'s motion vector computation.
 ## Last-known-good build state
 
 - Last successful build linked `VulkanEngine.exe` with Phase 1, 2, 3 and
-  Step 4a + most of 4b feature parity. Motion vector attachment shader
-  changes are in; final 4c (DLSS evaluate + render-scale) is pending.
+  the full Step 4a/4b/4c stack. DLSS off-path renders identically to
+  Phase 3 (full-res offscreen, no jitter, FXAA samples LDR). DLSS on-path
+  renders the offscreen at the NGX-reported optimal input size, runs
+  DLSS into `m_upscale`, and routes FXAA from there.
 - Shader count: 12 (same as before — no new shader files added; existing
   mesh.frag grew substantially).
 - Console on startup (5070 Ti, driver 591.86):

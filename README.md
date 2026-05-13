@@ -16,7 +16,7 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Mesh LOD groups with compute-side LOD selection and per-LOD indirect draw slots.
 - Bindless texture array with descriptor indexing and update-after-bind support.
 - Hardware ray tracing path with BLAS/TLAS builds, Vulkan ray queries, ray-traced shadows, reflections, and one-bounce GI.
-- Partial DLSS integration with NGX initialization, Halton jitter, motion-vector attachment, and DLSS UI controls.
+- DLSS Super Resolution path with NGX feature creation/evaluation, optimal render-size selection, Halton jitter, motion vectors, and full-resolution upscale output.
 - Job system with fire-and-forget tasks, blocking `parallel_for`, and frame-work barriers.
 - Variable-rate shading support through `VK_KHR_fragment_shading_rate`, with per-LOD rates and UI override when available.
 - Entity/component scene structure using EnTT.
@@ -45,6 +45,9 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - HZB now builds at half offscreen resolution to match the reducer shader and avoid screen-position-dependent false occlusion.
 - Ray-traced shadows can replace the CSM shadow pass, with the shadow image still transitioned so descriptors remain valid.
 - RT reflections and GI reuse mesh device addresses and material data to shade ray hits with interpolated normals and sun visibility.
+- DLSS render-scale plumbing now rebuilds offscreen, bloom, SSAO, composite, LDR, and HZB resources at the NGX optimal input size while presenting through a full-resolution upscale target.
+- FXAA now reads from the DLSS upscale target when DLSS is active, otherwise from the normal LDR target.
+- Motion-vector rendering writes a second RG16F attachment for DLSS, with blend state mirrored to avoid validation warnings.
 
 ## Tech Stack
 
@@ -129,8 +132,6 @@ If a Windows build fails with `LNK1168`, another program may be holding the exec
 
 ### RTX / Ray Tracing
 
-- DLSS evaluation path: call `NVSDK_NGX_VULKAN_CreateFeature_DLSS` and `NVSDK_NGX_VULKAN_EvaluateFeature`.
-- Render-scale plumbing: render at the DLSS-selected internal resolution and upscale to full output.
 - Previous per-instance transforms for true object motion vectors instead of camera-only motion.
 - Denoising and temporal accumulation for cleaner ray-traced GI and glossy reflections.
 
