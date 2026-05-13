@@ -36,7 +36,8 @@ struct ShadowData {
 };
 
 void createShadowResources(ShadowData& shadow, VkPhysicalDevice physicalDevice,
-                           VkDevice device, uint32_t framesInFlight);
+                           VkDevice device, VkCommandPool commandPool, VkQueue queue,
+                           uint32_t framesInFlight);
 
 void destroyShadowResources(VkDevice device, ShadowData& shadow);
 

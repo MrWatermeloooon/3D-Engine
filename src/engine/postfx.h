@@ -14,16 +14,21 @@ constexpr uint32_t SSAO_KERNEL_SIZE = 16;
 
 struct OffscreenTarget {
     AllocatedImage colorImage;
-    VkImageView    colorView   = VK_NULL_HANDLE;
+    VkImageView    colorView    = VK_NULL_HANDLE;
+    // Motion vectors — written as 2nd color attachment by mesh.frag. NDC-space
+    // (prev - curr) in [-1, 1] units. Consumed by DLSS (4c).
+    AllocatedImage motionImage;
+    VkImageView    motionView   = VK_NULL_HANDLE;
     AllocatedImage depthImage;
-    VkImageView    depthView   = VK_NULL_HANDLE;     // depth aspect (attachment + sampling)
-    VkRenderPass   renderPass  = VK_NULL_HANDLE;
-    VkFramebuffer  framebuffer = VK_NULL_HANDLE;
-    VkSampler      sampler     = VK_NULL_HANDLE;     // for sampling color in post-fx
-    VkSampler      depthSampler= VK_NULL_HANDLE;     // for sampling depth in SSAO
+    VkImageView    depthView    = VK_NULL_HANDLE;    // depth aspect (attachment + sampling)
+    VkRenderPass   renderPass   = VK_NULL_HANDLE;
+    VkFramebuffer  framebuffer  = VK_NULL_HANDLE;
+    VkSampler      sampler      = VK_NULL_HANDLE;    // for sampling color in post-fx
+    VkSampler      depthSampler = VK_NULL_HANDLE;    // for sampling depth in SSAO
     VkExtent2D     extent{};
-    VkFormat       colorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
-    VkFormat       depthFormat = VK_FORMAT_UNDEFINED;
+    VkFormat       colorFormat  = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormat       motionFormat = VK_FORMAT_R16G16_SFLOAT;
+    VkFormat       depthFormat  = VK_FORMAT_UNDEFINED;
 };
 
 // ── Bloom mip chain ─────────────────────────────────────────────────────────

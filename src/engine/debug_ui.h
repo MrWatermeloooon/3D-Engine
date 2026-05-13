@@ -11,6 +11,8 @@ class Camera;
 class ResourceManager;
 struct ShadowData;
 struct PostFXSettings;
+struct RtSettings;
+struct DlssSettings;
 
 class DebugUI {
 public:
@@ -23,6 +25,7 @@ public:
     void beginFrame();
     void buildUI(entt::registry& registry, ResourceManager& resources,
                  Camera& camera, ShadowData& shadow, PostFXSettings& postfx,
+                 RtSettings& rt, DlssSettings& dlss,
                  int visibleEntities, int totalEntities,
                  float deltaTime);
     void endFrame();

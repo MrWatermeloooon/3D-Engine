@@ -8,3 +8,5 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 VulkanSDK-Installer.exe
+DLSS_SDK/
+dlss_logs/

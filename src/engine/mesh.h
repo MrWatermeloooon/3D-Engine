@@ -5,6 +5,7 @@
 #include <string>
 #include "vertex.h"
 #include "buffer.h"
+#include "raytracing.h"
 
 struct Mesh {
     std::vector<Vertex> vertices;
@@ -16,6 +17,9 @@ struct Mesh {
     // Local-space AABB (computed from vertices)
     glm::vec3 aabbMin{0.0f};
     glm::vec3 aabbMax{0.0f};
+
+    // Per-mesh BLAS, populated by uploadMesh when RT_SUPPORTED. Empty otherwise.
+    RtMeshGeometry rt;
 };
 
 Mesh loadMeshFromObj(const std::string& filepath);

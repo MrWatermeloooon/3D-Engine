@@ -20,6 +20,11 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     mat4 view;
     mat4 proj;
     vec4 cameraPos;
+    vec4 rtParams;
+    vec4 rtParams2;
+    vec4 rtParams3;
+    mat4 prevViewProj;
+    vec4 jitterOffset;
 } scene;
 
 layout(location = 0) out vec3 vColor;

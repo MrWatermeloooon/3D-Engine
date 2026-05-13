@@ -4,6 +4,8 @@
 #include "components.h"
 #include "shadow.h"
 #include "postfx.h"
+#include "raytracing.h"
+#include "dlss.h"
 #include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
@@ -114,6 +116,7 @@ static const char* lightTypeName(entt::registry& reg, entt::entity e) {
 
 void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
                       Camera& camera, ShadowData& shadow, PostFXSettings& postfx,
+                      RtSettings& rt, DlssSettings& dlss,
                       int visibleEntities, int totalEntities,
                       float deltaTime)
 {
@@ -168,6 +171,8 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
         ImGui::DockBuilderDockWindow("Lights",           dockRight);
         ImGui::DockBuilderDockWindow("Post-Processing",  dockBottom);
         ImGui::DockBuilderDockWindow("Shadows (CSM)",    dockBottom);
+        ImGui::DockBuilderDockWindow("Ray Tracing",      dockBottom);
+        ImGui::DockBuilderDockWindow("DLSS",             dockBottom);
         ImGui::DockBuilderDockWindow("Camera",           dockBottom);
         ImGui::DockBuilderFinish(dockId);
     }
@@ -500,6 +505,74 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
         if (ImGui::CollapsingHeader("Vignette")) {
             ImGui::SliderFloat("Intensity", &postfx.vignetteIntensity, 0.0f, 1.0f);
             ImGui::SliderFloat("Falloff",   &postfx.vignetteFalloff,   0.0f, 0.5f);
+        }
+    }
+    ImGui::End();
+
+    // ── Ray Tracing ─────────────────────────────────────────────────────
+    if (ImGui::Begin("Ray Tracing")) {
+        if (!RT_SUPPORTED) {
+            ImGui::TextDisabled("RT not supported by this device / driver.");
+            ImGui::TextDisabled("Check the console for which extension or feature is missing.");
+        } else {
+            ImGui::Text("RT supported: BLAS/TLAS + ray queries available");
+            ImGui::Separator();
+            ImGui::Checkbox("Enable Ray Tracing", &rt.enabled);
+            ImGui::BeginDisabled(!rt.enabled);
+            ImGui::Checkbox("RT Shadows (replaces CSM)", &rt.shadows);
+            ImGui::Checkbox("Sun only (CSM parity)", &rt.sunOnly);
+            ImGui::TextDisabled("ON = shadow only the first directional light");
+            ImGui::SliderFloat("Light angular radius", &rt.shadowSoftness, 0.0f, 0.1f,
+                               "%.4f rad");
+            ImGui::TextDisabled("0.0046 ≈ real sun, larger = softer penumbra");
+            ImGui::SliderInt("Samples / light / fragment", &rt.shadowSamples, 1, 64);
+            ImGui::TextDisabled("Higher = smoother shadows, more GPU cost");
+            ImGui::Separator();
+            ImGui::Checkbox("RT Reflections", &rt.reflections);
+            ImGui::TextDisabled("Mirror + glossy on metals (Fresnel-weighted)");
+            ImGui::BeginDisabled(!rt.reflections);
+            ImGui::SliderInt("Reflection samples", &rt.reflectionSamples, 1, 16);
+            ImGui::SliderFloat("Reflection max dist", &rt.reflectionMaxDist, 5.0f, 500.0f, "%.0f");
+            ImGui::SliderFloat("Reflection intensity", &rt.reflectionIntensity, 0.0f, 2.0f);
+            ImGui::EndDisabled();
+            ImGui::Separator();
+            ImGui::Checkbox("RT Global Illumination", &rt.gi);
+            ImGui::TextDisabled("One-bounce indirect — replaces hemisphere ambient");
+            ImGui::BeginDisabled(!rt.gi);
+            ImGui::SliderInt("GI samples", &rt.giSamples, 1, 16);
+            ImGui::SliderFloat("GI max dist", &rt.giMaxDist, 5.0f, 100.0f, "%.0f");
+            ImGui::SliderFloat("GI mix (0=smooth, 1=full RT)", &rt.giIntensity, 0.0f, 1.0f);
+            ImGui::EndDisabled();
+            ImGui::EndDisabled();
+        }
+    }
+    ImGui::End();
+
+    // ── DLSS ────────────────────────────────────────────────────────────
+    if (ImGui::Begin("DLSS")) {
+        if (!dlssAvailable()) {
+            ImGui::TextDisabled("DLSS unavailable. See console for NGX init details.");
+        } else {
+            ImGui::Text("DLSS Super Sampling: ready");
+            ImGui::Separator();
+            ImGui::Checkbox("Enable DLSS", &dlss.enabled);
+            ImGui::TextDisabled("Phase 4b: jitter + scaffolding active; upscale pass lands in 4c.");
+            ImGui::BeginDisabled(!dlss.enabled);
+            ImGui::Checkbox("Sub-pixel jitter", &dlss.jitterEnabled);
+            ImGui::TextDisabled("Halton(2,3) 8-frame cycle on the camera proj.");
+            const char* presets[] = {
+                "Performance (50%)", "Balanced (58%)", "Quality (66%)",
+                "Ultra Performance (33%)", "DLAA (100%)"
+            };
+            // DlssQuality enum values 0..4 happen to map cleanly to the
+            // presets order above when treated as indices via static_cast.
+            int q = static_cast<int>(dlss.quality);
+            // Clamp into the enum range for the combo (UltraPerformance=3, DLAA=4).
+            q = std::max(0, std::min(4, q));
+            if (ImGui::Combo("Preset", &q, presets, IM_ARRAYSIZE(presets))) {
+                dlss.quality = static_cast<DlssQuality>(q);
+            }
+            ImGui::EndDisabled();
         }
     }
     ImGui::End();

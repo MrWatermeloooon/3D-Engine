@@ -38,6 +38,17 @@ AllocatedBuffer createBuffer(VkPhysicalDevice physicalDevice, VkDevice device,
     allocInfo.allocationSize = memReqs.size;
     allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, properties);
 
+    // Buffers that callers will read via device address (ray-tracing inputs,
+    // acceleration structure storage, scratch) must opt into the matching
+    // memory allocate flag. Detect the usage flag here so callers don't need
+    // to remember the dual configuration.
+    VkMemoryAllocateFlagsInfo flagsInfo{};
+    flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
+        allocInfo.pNext = &flagsInfo;
+    }
+
     VK_CHECK(vkAllocateMemory(device, &allocInfo, nullptr, &result.memory));
     vkBindBufferMemory(device, result.buffer, result.memory, 0);
 

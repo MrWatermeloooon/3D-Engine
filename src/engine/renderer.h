@@ -16,6 +16,7 @@
 #include "skeletal.h"
 #include "gpu_cull.h"
 #include "hzb.h"
+#include "raytracing.h"
 
 class ResourceManager;
 
@@ -54,6 +55,12 @@ struct DrawFrameInfo {
     IndirectBuffer*      indirect;
     GpuCullData*         gpuCull;
     HzbData*             hzb;
+
+    // Ray tracing (Phase 1b: TLAS rebuilt per-frame from the registry's
+    // visible meshes. Consumed by ray queries in Phase 1c).
+    RtScene*             rtScene        = nullptr;
+    RtSettings*          rtSettings     = nullptr;
+    VkPhysicalDevice     physicalDevice = VK_NULL_HANDLE; // for TLAS resize
 
     // Skeletal animation
     SkinnedMesh*         skinnedMesh        = nullptr;

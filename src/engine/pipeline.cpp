@@ -108,14 +108,17 @@ PipelineData createGraphicsPipeline(VkDevice device, VkRenderPass renderPass, Vk
     depthStencil.depthWriteEnable = VK_TRUE;
     depthStencil.depthCompareOp   = VK_COMPARE_OP_LESS;
 
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-                                   | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    // Two color attachments now: HDR color + motion vectors. Both use the
+    // standard "write all components, no blending" state.
+    VkPipelineColorBlendAttachmentState blendAttachments[2]{};
+    blendAttachments[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blendAttachments[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
 
     VkPipelineColorBlendStateCreateInfo colorBlending{};
     colorBlending.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    colorBlending.attachmentCount = 1;
-    colorBlending.pAttachments    = &blendAttachment;
+    colorBlending.attachmentCount = 2;
+    colorBlending.pAttachments    = blendAttachments;
 
     // Add VRS dynamic state only when the device supports VK_KHR_fragment_shading_rate.
     // If we list it on an unsupported device, pipeline creation fails.
@@ -334,14 +337,17 @@ PipelineData createSkinnedPipeline(VkDevice device, VkRenderPass renderPass, VkE
     ds.depthWriteEnable = VK_TRUE;
     ds.depthCompareOp   = VK_COMPARE_OP_LESS;
 
-    VkPipelineColorBlendAttachmentState blend{};
-    blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-                         | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    // Skinned pipeline shares the main offscreen render pass which now has
+    // 2 color attachments (color + motion). Mirror the blend states.
+    VkPipelineColorBlendAttachmentState blends[2]{};
+    blends[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                             | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blends[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
 
     VkPipelineColorBlendStateCreateInfo cb{};
     cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 1;
-    cb.pAttachments    = &blend;
+    cb.attachmentCount = 2;
+    cb.pAttachments    = blends;
 
     VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo dynState{};

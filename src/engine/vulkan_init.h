@@ -29,7 +29,8 @@ VkInstance createInstance(const std::vector<const char*>& requiredExtensions);
 VkDebugUtilsMessengerEXT setupDebugMessenger(VkInstance instance);
 VkPhysicalDevice pickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface);
 QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface);
-VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyIndices& indices);
+VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyIndices& indices,
+                             const std::vector<const char*>& extraExtensions = {});
 
 // Cleanup
 void destroyDebugMessenger(VkInstance instance, VkDebugUtilsMessengerEXT messenger);
@@ -57,3 +58,17 @@ inline const std::vector<const char*> DEVICE_EXTENSIONS = {
 // all VRS code paths gracefully no-op.
 extern bool                                  VRS_SUPPORTED;
 extern PFN_vkCmdSetFragmentShadingRateKHR    VRS_SetRate;
+
+// Ray tracing: probed at device creation. If the GPU exposes
+// VK_KHR_acceleration_structure + VK_KHR_ray_query + VK_KHR_deferred_host_operations
+// AND the relevant features, RT_SUPPORTED is set and the AS function pointers
+// are loaded. Otherwise all RT code paths gracefully no-op (engine falls back
+// to the existing CSM shadow path).
+extern bool RT_SUPPORTED;
+extern PFN_vkCreateAccelerationStructureKHR                 RT_CreateAS;
+extern PFN_vkDestroyAccelerationStructureKHR                RT_DestroyAS;
+extern PFN_vkGetAccelerationStructureBuildSizesKHR          RT_GetASBuildSizes;
+extern PFN_vkGetAccelerationStructureDeviceAddressKHR       RT_GetASDeviceAddress;
+extern PFN_vkCmdBuildAccelerationStructuresKHR              RT_CmdBuildAS;
+extern PFN_vkCmdWriteAccelerationStructuresPropertiesKHR    RT_CmdWriteASProps;
+extern PFN_vkGetBufferDeviceAddressKHR                      RT_GetBufferDeviceAddress;

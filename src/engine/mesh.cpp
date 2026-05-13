@@ -2,6 +2,7 @@
 #include <tiny_obj_loader.h>
 
 #include "mesh.h"
+#include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
 #include <unordered_map>
@@ -223,6 +224,20 @@ Mesh createIcosphereMesh(uint32_t subdivisions) {
 
 void uploadMesh(Mesh& mesh, VkPhysicalDevice physicalDevice, VkDevice device,
                 VkCommandPool commandPool, VkQueue queue) {
+    // When RT is supported, the vertex + index buffers must also be readable
+    // by acceleration-structure builds and reachable via device address.
+    VkBufferUsageFlags vbUsage = VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                               | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    VkBufferUsageFlags ibUsage = VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                               | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    if (RT_SUPPORTED) {
+        VkBufferUsageFlags rtExtra = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                                   | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                                   | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        vbUsage |= rtExtra;
+        ibUsage |= rtExtra;
+    }
+
     // Vertex buffer via staging
     VkDeviceSize vbSize = sizeof(Vertex) * mesh.vertices.size();
 
@@ -236,8 +251,7 @@ void uploadMesh(Mesh& mesh, VkPhysicalDevice physicalDevice, VkDevice device,
     vkUnmapMemory(device, staging.memory);
 
     mesh.vertexBuffer = createBuffer(physicalDevice, device, vbSize,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vbUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     copyBuffer(device, commandPool, queue, staging.buffer, mesh.vertexBuffer.buffer, vbSize);
     destroyBuffer(device, staging);
@@ -254,14 +268,19 @@ void uploadMesh(Mesh& mesh, VkPhysicalDevice physicalDevice, VkDevice device,
     vkUnmapMemory(device, staging.memory);
 
     mesh.indexBuffer = createBuffer(physicalDevice, device, ibSize,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        ibUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     copyBuffer(device, commandPool, queue, staging.buffer, mesh.indexBuffer.buffer, ibSize);
     destroyBuffer(device, staging);
+
+    // Build per-mesh BLAS if RT is available. Falls through silently otherwise.
+    if (RT_SUPPORTED) {
+        buildMeshBlas(mesh, physicalDevice, device, commandPool, queue);
+    }
 }
 
 void destroyMesh(VkDevice device, Mesh& mesh) {
+    destroyRtMeshGeometry(device, mesh.rt);
     destroyBuffer(device, mesh.vertexBuffer);
     destroyBuffer(device, mesh.indexBuffer);
 }

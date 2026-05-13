@@ -368,13 +368,16 @@ static void recordMainPass(VkCommandBuffer cmd, OffscreenTarget& offscreen,
                            ResourceManager& resources,
                            int vrsMode)
 {
-    std::array<VkClearValue, 2> clearValues{};
+    // Offscreen render pass now has 3 attachments: color, motion, depth.
+    std::array<VkClearValue, 3> clearValues{};
     clearValues[0].color.float32[0] = 0.05f;
     clearValues[0].color.float32[1] = 0.06f;
     clearValues[0].color.float32[2] = 0.08f;
     clearValues[0].color.float32[3] = 1.0f;
-    clearValues[1].depthStencil.depth   = 1.0f;
-    clearValues[1].depthStencil.stencil = 0;
+    clearValues[1].color.float32[0] = 0.0f; // motion: clear to zero
+    clearValues[1].color.float32[1] = 0.0f;
+    clearValues[2].depthStencil.depth   = 1.0f;
+    clearValues[2].depthStencil.stencil = 0;
 
     VkRenderPassBeginInfo rpBegin{};
     rpBegin.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -615,6 +618,53 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
+    // ── TLAS build (RT) ─────────────────────────────────────────────────────
+    // Walk the visible meshes and gather their world transforms + BLAS
+    // addresses, then rebuild the TLAS into the per-frame buffer. The build
+    // includes its own post-barrier so subsequent shaders can ray-query it.
+    // Skip cleanly when RT is unsupported, disabled, or no instances exist.
+    if (RT_SUPPORTED && info.rtScene && info.rtSettings && info.rtSettings->enabled) {
+        std::vector<RtInstanceDesc> rtInstances;
+        rtInstances.reserve(static_cast<size_t>(total));
+
+        auto rtView = info.registry->view<TransformComponent, MeshComponent, MaterialComponent>();
+        for (auto e : rtView) {
+            // LOD0 mesh is what we trace against (shadow rays don't need LOD).
+            MeshHandle h{0};
+            if (auto* lod = info.registry->try_get<MeshLODComponent>(e);
+                lod && info.resources->hasLODGroup(lod->group))
+            {
+                h = info.resources->getLODGroup(lod->group).levels[0].mesh;
+            } else {
+                h = rtView.get<MeshComponent>(e).handle;
+            }
+            const Mesh& m = info.resources->getMesh(h);
+            if (m.rt.deviceAddress == 0) continue; // BLAS missing — skip
+            const auto& mat = rtView.get<MaterialComponent>(e);
+            RtInstanceDesc d{};
+            d.transform           = rtView.get<TransformComponent>(e).getMatrix();
+            d.blasAddress         = m.rt.deviceAddress;
+            d.material.color      = mat.color;
+            d.material.params     = glm::vec4(mat.metallic, mat.roughness, 0.0f, 0.0f);
+            d.material.vertexAddr = splitAddress(
+                getBufferDeviceAddress(device, m.vertexBuffer.buffer));
+            d.material.indexAddr  = splitAddress(
+                getBufferDeviceAddress(device, m.indexBuffer.buffer));
+            rtInstances.push_back(d);
+        }
+
+        buildTlas(*info.rtScene, frame, info.physicalDevice, device, cmd, rtInstances);
+
+        // Point this frame's scene descriptor at the freshly built TLAS so
+        // mesh.frag's ray queries see it. The TLAS handle is stable across
+        // frames unless storage grows; we write it unconditionally because the
+        // write is cheap and idempotent.
+        writeSceneTlas(*info.descriptors, device, frame, info.rtScene->tlas[frame]);
+        writeSceneRtMaterials(*info.descriptors, device, frame,
+                              info.rtScene->materialBuffer[frame].buffer,
+                              info.rtScene->materialCapacity[frame]);
+    }
+
     info.cullParams->numCandidates = build.numCandidates;
     if (build.numCandidates > 0) {
         dispatchCull(cmd, *info.gpuCull, frame, *info.cullParams);
@@ -630,9 +680,16 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
             0, 1, &mb, 0, nullptr, 0, nullptr);
     }
 
-    recordShadowPass(cmd, *info.shadow, info.shadowPipeline, info.shadowLayout,
-                     *info.cascadeUbo, build.batches, shadowInstBuf, indirectBuf,
-                     *info.resources);
+    // Skip the CSM pass entirely when RT shadows are doing the work — the
+    // fragment shader's CSM branch is dead in that case, so the maps would
+    // just be expensive scratch.
+    const bool rtShadowsActive = RT_SUPPORTED && info.rtSettings
+                              && info.rtSettings->enabled && info.rtSettings->shadows;
+    if (!rtShadowsActive) {
+        recordShadowPass(cmd, *info.shadow, info.shadowPipeline, info.shadowLayout,
+                         *info.cascadeUbo, build.batches, shadowInstBuf, indirectBuf,
+                         *info.resources);
+    }
 
     recordMainPass(cmd, *info.offscreen, info.mainPipeline, info.mainLayout,
                    info.descriptors->sceneSets[frame],

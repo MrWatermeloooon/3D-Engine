@@ -1,15 +1,24 @@
 #include "descriptors.h"
 #include "lights.h"
 #include "shadow.h"
+#include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
 #include <array>
 #include <cstring>
 
 VkDescriptorSetLayout createSceneSetLayout(VkDevice device) {
-    std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
+    // When RT is supported we tack on additional bindings for the top-level
+    // acceleration structure (4) and the parallel per-instance material SSBO
+    // for ray-traced reflections / GI (5). The mesh.frag shader always
+    // declares the bindings (compiled once with ray-query support) — for
+    // RT-unsupported devices we skip them, fall back to CSM exclusively, and
+    // the validation layer is happy because the shader never executes the
+    // gated branches.
+    const uint32_t bindingCount = RT_SUPPORTED ? 6u : 4u;
+    std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
 
-    // Binding 0: scene UBO (view, proj, cameraPos)
+    // Binding 0: scene UBO (view, proj, cameraPos, rtParams)
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -33,9 +42,23 @@ VkDescriptorSetLayout createSceneSetLayout(VkDevice device) {
     bindings[3].descriptorCount = 1;
     bindings[3].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+    if (RT_SUPPORTED) {
+        // Binding 4: TLAS for ray-queried shadows / reflections / GI.
+        bindings[4].binding         = 4;
+        bindings[4].descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        bindings[4].descriptorCount = 1;
+        bindings[4].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        // Binding 5: per-instance shading materials (indexed by
+        // gl_RayQueryInstanceCustomIndexEXT in the hit handler).
+        bindings[5].binding         = 5;
+        bindings[5].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[5].descriptorCount = 1;
+        bindings[5].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.bindingCount = bindingCount;
     layoutInfo.pBindings    = bindings.data();
 
     VkDescriptorSetLayout layout;
@@ -94,19 +117,25 @@ void createUniformBuffers(DescriptorData& data, VkPhysicalDevice physicalDevice,
 void createDescriptorPool(DescriptorData& data, VkDevice device,
                           uint32_t framesInFlight, uint32_t maxMaterials) {
     (void)maxMaterials; // bindless: textures live in a single global set
-    VkDescriptorPoolSize poolSizes[] = {
+    std::vector<VkDescriptorPoolSize> poolSizes = {
         // Scene UBO + lights UBO + cascade UBO + bone UBO per frame
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         framesInFlight * 4 },
         // Shadow map per frame + entire bindless texture array (allocated once)
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, framesInFlight + BINDLESS_MAX_TEXTURES },
     };
+    if (RT_SUPPORTED) {
+        poolSizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+                              framesInFlight });
+        poolSizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                              framesInFlight });
+    }
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
                            | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
-    poolInfo.poolSizeCount = 2;
-    poolInfo.pPoolSizes    = poolSizes;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes    = poolSizes.data();
     poolInfo.maxSets       = framesInFlight + 1 /*bindless*/ + framesInFlight /*bones*/;
 
     VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, nullptr, &data.descriptorPool));
@@ -214,4 +243,44 @@ void writeBindlessTexture(DescriptorData& data, VkDevice device,
 void updateUniformBuffer(DescriptorData& data, uint32_t currentFrame,
                          const UniformBufferObject& ubo) {
     memcpy(data.uniformBuffersMapped[currentFrame], &ubo, sizeof(ubo));
+}
+
+void writeSceneTlas(DescriptorData& data, VkDevice device, uint32_t frame,
+                    VkAccelerationStructureKHR tlas)
+{
+    if (!RT_SUPPORTED || tlas == VK_NULL_HANDLE) return;
+
+    VkWriteDescriptorSetAccelerationStructureKHR asWrite{};
+    asWrite.sType                      = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+    asWrite.accelerationStructureCount = 1;
+    asWrite.pAccelerationStructures    = &tlas;
+
+    VkWriteDescriptorSet w{};
+    w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.pNext           = &asWrite;
+    w.dstSet          = data.sceneSets[frame];
+    w.dstBinding      = 4;
+    w.descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    w.descriptorCount = 1;
+    vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
+}
+
+void writeSceneRtMaterials(DescriptorData& data, VkDevice device, uint32_t frame,
+                           VkBuffer buffer, VkDeviceSize bufferSize)
+{
+    if (!RT_SUPPORTED || buffer == VK_NULL_HANDLE) return;
+
+    VkDescriptorBufferInfo bi{};
+    bi.buffer = buffer;
+    bi.offset = 0;
+    bi.range  = bufferSize;
+
+    VkWriteDescriptorSet w{};
+    w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet          = data.sceneSets[frame];
+    w.dstBinding      = 5;
+    w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.descriptorCount = 1;
+    w.pBufferInfo     = &bi;
+    vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
 }

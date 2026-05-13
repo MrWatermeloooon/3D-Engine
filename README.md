@@ -15,6 +15,8 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - HZB occlusion culling with a compute-built hierarchical depth buffer from the previous frame.
 - Mesh LOD groups with compute-side LOD selection and per-LOD indirect draw slots.
 - Bindless texture array with descriptor indexing and update-after-bind support.
+- Hardware ray tracing path with BLAS/TLAS builds, Vulkan ray queries, ray-traced shadows, reflections, and one-bounce GI.
+- Partial DLSS integration with NGX initialization, Halton jitter, motion-vector attachment, and DLSS UI controls.
 - Job system with fire-and-forget tasks, blocking `parallel_for`, and frame-work barriers.
 - Variable-rate shading support through `VK_KHR_fragment_shading_rate`, with per-LOD rates and UI override when available.
 - Entity/component scene structure using EnTT.
@@ -38,6 +40,11 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - CPU-side visible sorting has been replaced by GPU culling: the CPU writes candidate instances and batch headers, then compute fills visible main-pass instances and unconditional shadow instances.
 - The renderer now builds a hierarchical Z buffer after the main pass and uses it for next-frame occlusion culling.
 - LOD spheres and per-LOD indirect commands exercise distance-based mesh selection without changing the graphics draw path.
+- Vulkan depth convention fixes now define `GLM_FORCE_DEPTH_ZERO_TO_ONE` and `GLM_FORCE_RADIANS`, correcting camera projection, cascade extraction, and shadow ortho math.
+- Shadow cascade stability improved by pulling the light origin back to avoid clipping tall off-frustum casters.
+- HZB now builds at half offscreen resolution to match the reducer shader and avoid screen-position-dependent false occlusion.
+- Ray-traced shadows can replace the CSM shadow pass, with the shadow image still transitioned so descriptors remain valid.
+- RT reflections and GI reuse mesh device addresses and material data to shade ray hits with interpolated normals and sun visibility.
 
 ## Tech Stack
 
@@ -74,6 +81,7 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Ninja build system.
 - vcpkg installed with `VCPKG_ROOT` set.
 - A GPU and driver with Vulkan support.
+- NVIDIA DLSS SDK cloned locally to `DLSS_SDK/` for DLSS-enabled builds. The SDK is intentionally ignored by Git because it contains large third-party binaries.
 
 ## Build
 
@@ -106,6 +114,10 @@ After building, run the generated `VulkanEngine` executable from the build outpu
 
 The repository intentionally ignores local build output, Visual Studio metadata, compiled SPIR-V files, and the Vulkan SDK installer. Install the Vulkan SDK locally instead of committing the installer into Git.
 
+The local `DLSS_SDK/` checkout is also ignored. Clone or install NVIDIA's DLSS SDK into that folder before configuring if you want to build the DLSS integration.
+
+If a Windows build fails with `LNK1168`, another program may be holding the executable open. Close capture/overlay tools such as Medal, OBS, or Overwolf, then rebuild.
+
 ## Future Additions
 
 ### Core Rendering
@@ -117,10 +129,10 @@ The repository intentionally ignores local build output, Visual Studio metadata,
 
 ### RTX / Ray Tracing
 
-- Ray traced shadows: replace shadow maps with accurate ray traced soft shadows.
-- Ray traced reflections: mirror and glossy reflections without screen-space limits.
-- Global illumination: one-bounce indirect light bouncing through the scene.
-- DLSS: AI upscaling for rendering at a lower internal resolution while outputting full-resolution frames.
+- DLSS evaluation path: call `NVSDK_NGX_VULKAN_CreateFeature_DLSS` and `NVSDK_NGX_VULKAN_EvaluateFeature`.
+- Render-scale plumbing: render at the DLSS-selected internal resolution and upscale to full output.
+- Previous per-instance transforms for true object motion vectors instead of camera-only motion.
+- Denoising and temporal accumulation for cleaner ray-traced GI and glossy reflections.
 
 ### Visual Quality
 

@@ -1,11 +1,13 @@
 #include "engine.h"
 #include "frustum.h"
+#include "dlss.h"
 
 #include <imgui.h>
 
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <cstring>
 
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -15,14 +17,34 @@ void Engine::init() {
     m_window = new Window(1280, 720, "VulkanEngine");
 
     auto extensions = m_window->getRequiredExtensions();
+
+    // NGX needs specific instance extensions to be enabled for DLSS. Query
+    // them before instance creation and merge. Safe if DLSS is unavailable —
+    // returns an empty list.
+    auto dlssInstanceExts = dlssRequiredInstanceExtensions();
+    for (const char* e : dlssInstanceExts) {
+        bool present = false;
+        for (const char* x : extensions) if (std::strcmp(x, e) == 0) { present = true; break; }
+        if (!present) extensions.push_back(e);
+    }
+
     m_vk.instance       = createInstance(extensions);
     m_vk.debugMessenger = setupDebugMessenger(m_vk.instance);
     m_vk.surface        = m_window->createSurface(m_vk.instance);
     m_vk.physicalDevice = pickPhysicalDevice(m_vk.instance, m_vk.surface);
     m_vk.queueFamilies  = findQueueFamilies(m_vk.physicalDevice, m_vk.surface);
-    m_vk.device         = createLogicalDevice(m_vk.physicalDevice, m_vk.queueFamilies);
+
+    // Same dance for device extensions — must be queried after VkInstance +
+    // physical device exist and passed into device creation.
+    auto dlssDeviceExts = dlssRequiredDeviceExtensions(m_vk.instance, m_vk.physicalDevice);
+
+    m_vk.device         = createLogicalDevice(m_vk.physicalDevice, m_vk.queueFamilies,
+                                              dlssDeviceExts);
     vkGetDeviceQueue(m_vk.device, m_vk.queueFamilies.graphicsFamily.value(), 0, &m_vk.graphicsQueue);
     vkGetDeviceQueue(m_vk.device, m_vk.queueFamilies.presentFamily.value(),  0, &m_vk.presentQueue);
+
+    // DLSS init — capability query only. No upscale path yet (phases 4b/4c).
+    dlssInit(m_vk.instance, m_vk.physicalDevice, m_vk.device);
 
     createCommandPool(m_renderer, m_vk.device, m_vk.queueFamilies.graphicsFamily.value());
 
@@ -57,7 +79,9 @@ void Engine::init() {
     createLdrTarget(m_ldr, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
 
     // Shadow
-    createShadowResources(m_shadow, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
+    createShadowResources(m_shadow, m_vk.physicalDevice, m_vk.device,
+                          m_renderer.commandPool, m_vk.graphicsQueue,
+                          MAX_FRAMES_IN_FLIGHT);
 
     // Light buffers
     createLightBuffers(m_lightBuffers, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
@@ -86,9 +110,19 @@ void Engine::init() {
 
     // HZB: occlusion-culling pyramid built from the previous frame's depth
     // attachment. Created after offscreen so depthView/depthSampler exist.
+    // HZB mip 0 is HALF the depth resolution — hzb_reduce.comp does a 2×2
+    // max-pool with `srcBase = dst * 2`, which only works if the source is
+    // twice the destination size. Passing the full depth extent here would
+    // make ~75% of mip 0 clamp to the depth attachment's bottom-right pixel,
+    // contaminating later mips and causing screen-position-dependent
+    // false-occlusion in the cull pass.
+    VkExtent2D hzbExtent = {
+        std::max(1u, m_offscreen.extent.width  / 2u),
+        std::max(1u, m_offscreen.extent.height / 2u),
+    };
     createHzb(m_hzb, m_vk.physicalDevice, m_vk.device,
               m_renderer.commandPool, m_vk.graphicsQueue,
-              m_offscreen.extent,
+              hzbExtent,
               m_offscreen.depthView, m_offscreen.depthSampler,
               "shaders/hzb_reduce.comp.spv");
 
@@ -96,6 +130,10 @@ void Engine::init() {
                             m_candidates, m_batchHeaders,
                             m_mainInstances, m_shadowInstances, m_indirect,
                             m_hzb.fullView, m_hzb.sampler);
+
+    // Ray tracing scaffolding. Phase 1a: just sizes per-frame containers.
+    // No BLAS/TLAS exist yet — those come in Phase 1b.
+    createRtScene(m_rtScene, m_vk.device, MAX_FRAMES_IN_FLIGHT);
 
     // Descriptor set layouts (scene + material)
     m_descriptors.sceneSetLayout    = createSceneSetLayout(m_vk.device);
@@ -281,7 +319,7 @@ void Engine::run() {
 
         m_debugUI.beginFrame();
         m_debugUI.buildUI(m_scene.registry(), m_resources, m_camera, m_shadow,
-                          m_postFXSettings,
+                          m_postFXSettings, m_rtSettings, m_dlssSettings,
                           m_visibleEntities, m_totalEntities,
                           dt);
         m_debugUI.endFrame();
@@ -301,11 +339,58 @@ void Engine::run() {
         ubo.proj      = m_camera.getProjectionMatrix();
         ubo.cameraPos = glm::vec4(m_camera.getPosition(), 1.0f);
 
-        // Update post-fx UBOs
+        // DLSS sub-pixel jitter — applied directly to the projection matrix.
+        // For column-major GLM, proj[2][0] / proj[2][1] are the X / Y
+        // translation entries of clip space. Adding `j * 2 / extent` shifts
+        // every vertex by exactly `j` pixels in screen space (NDC is [-1,1]
+        // across the full extent). Jitter is gated by DLSS enable so it's
+        // invisible until you toggle DLSS on.
+        glm::vec2 jitterNDC(0.0f);
+        if (m_dlssSettings.enabled && m_dlssSettings.jitterEnabled) {
+            glm::vec2 j = haltonJitter(m_haltonIndex);
+            m_haltonIndex = (m_haltonIndex % 8u) + 1u; // 8-frame cycle
+            jitterNDC = glm::vec2(j.x * 2.0f / float(m_swapchain.extent.width),
+                                  j.y * 2.0f / float(m_swapchain.extent.height));
+            ubo.proj[2][0] += jitterNDC.x;
+            ubo.proj[2][1] += jitterNDC.y;
+        }
+        ubo.jitterOffset = glm::vec4(jitterNDC, 0.0f, 0.0f);
+        ubo.prevViewProj = m_dlssPrevViewProj;
+        // RT shadow uniform — feeds the gated branch in mesh.frag. Setting x=0
+        // makes the shader take the CSM path (and never touches binding 4).
+        const bool rtShadowsActive = RT_SUPPORTED && m_rtSettings.enabled && m_rtSettings.shadows;
+        // x=enabled, y=softness, z=samples, w=sunOnly flag
+        ubo.rtParams  = glm::vec4(rtShadowsActive ? 1.0f : 0.0f,
+                                  m_rtSettings.shadowSoftness,
+                                  static_cast<float>(m_rtSettings.shadowSamples),
+                                  m_rtSettings.sunOnly ? 1.0f : 0.0f);
+        const bool rtReflectionsActive = RT_SUPPORTED && m_rtSettings.enabled && m_rtSettings.reflections;
+        ubo.rtParams2 = glm::vec4(rtReflectionsActive ? 1.0f : 0.0f,
+                                  static_cast<float>(m_rtSettings.reflectionSamples),
+                                  m_rtSettings.reflectionMaxDist,
+                                  m_rtSettings.reflectionIntensity);
+        const bool rtGiActive = RT_SUPPORTED && m_rtSettings.enabled && m_rtSettings.gi;
+        ubo.rtParams3 = glm::vec4(rtGiActive ? 1.0f : 0.0f,
+                                  static_cast<float>(m_rtSettings.giSamples),
+                                  m_rtSettings.giMaxDist,
+                                  m_rtSettings.giIntensity);
+
+        // Update post-fx UBOs.
+        //
+        // When RT shadows are active, suppress SSAO too. SSAO darkens
+        // crevices using screen-space depth derivatives — its dark halo at
+        // contact points reads as a second shadow stacked on the RT shadow.
+        // Phase 3 (ray-traced GI) will replace SSAO with proper indirect
+        // occlusion; until then we hide the conflict by temporarily forcing
+        // SSAO off when RT shadows are on. Restoring the user's choice when
+        // RT is off.
+        PostFXSettings effectiveFx = m_postFXSettings;
+        if (rtShadowsActive) effectiveFx.ssaoEnabled = false;
+
         glm::mat4 proj    = m_camera.getProjectionMatrix();
         glm::mat4 invProj = glm::inverse(proj);
-        updateSSAOUbo(m_ssao, frame, proj, invProj, m_swapchain.extent, m_postFXSettings);
-        updateCompositeUbo(m_composite, frame, m_postFXSettings);
+        updateSSAOUbo(m_ssao, frame, proj, invProj, m_swapchain.extent, effectiveFx);
+        updateCompositeUbo(m_composite, frame, effectiveFx);
 
         // Advance animators and update bone palette UBO for this frame
         BonePalette palette{};
@@ -365,6 +450,9 @@ void Engine::run() {
         info.shadowInstances = &m_shadowInstances;
         info.indirect        = &m_indirect;
         info.gpuCull         = &m_gpuCull;
+        info.rtScene         = &m_rtScene;
+        info.rtSettings      = &m_rtSettings;
+        info.physicalDevice  = m_vk.physicalDevice;
         info.skinnedMesh     = &m_skinnedMesh;
         info.skinnedPipeline = m_skinnedPipeline.graphicsPipeline;
         info.skinnedLayout   = m_skinnedPipeline.pipelineLayout;
@@ -385,6 +473,11 @@ void Engine::run() {
             // project AABBs into the HZB the GPU just built.
             m_prevViewProj = currViewProj;
             m_hasPrevVP    = true;
+            // Also save the *jittered* view-proj for DLSS motion vectors.
+            // We use the same `currViewProj` for both purposes — the cull
+            // pass doesn't care about jitter (sub-pixel) but motion vectors
+            // need the actual rasterisation matrix.
+            m_dlssPrevViewProj = ubo.proj * ubo.view;
         }
     }
     vkDeviceWaitIdle(m_vk.device);
@@ -435,10 +528,15 @@ void Engine::recreateSwapchain() {
     createLdrTarget(m_ldr, m_vk.physicalDevice, m_vk.device, m_swapchain.extent);
 
     // Rebuild HZB (depends on offscreen depth + extent) and re-point the cull
-    // descriptor sets at the new HZB views.
+    // descriptor sets at the new HZB views. Half-extent — see note at the
+    // initial createHzb call.
+    VkExtent2D hzbExtent = {
+        std::max(1u, m_offscreen.extent.width  / 2u),
+        std::max(1u, m_offscreen.extent.height / 2u),
+    };
     createHzb(m_hzb, m_vk.physicalDevice, m_vk.device,
               m_renderer.commandPool, m_vk.graphicsQueue,
-              m_offscreen.extent,
+              hzbExtent,
               m_offscreen.depthView, m_offscreen.depthSampler,
               "shaders/hzb_reduce.comp.spv");
     writeGpuCullDescriptors(m_gpuCull, m_vk.device,
@@ -481,6 +579,7 @@ void Engine::cleanup() {
     for (auto& ub : m_descriptors.uniformBuffers) destroyBuffer(m_vk.device, ub);
 
     destroyLightBuffers(m_vk.device, m_lightBuffers);
+    destroyRtScene(m_vk.device, m_rtScene);
     destroyHzb(m_vk.device, m_hzb);
     destroyGpuCull(m_vk.device, m_gpuCull);
     destroyCandidateBuffer(m_vk.device, m_candidates);
@@ -522,6 +621,8 @@ void Engine::cleanup() {
     vkDestroyRenderPass(m_vk.device, m_swapchain.renderPass, nullptr);
     for (auto iv : m_swapchain.imageViews) vkDestroyImageView(m_vk.device, iv, nullptr);
     vkDestroySwapchainKHR(m_vk.device, m_swapchain.swapchain, nullptr);
+
+    dlssShutdown(m_vk.device);
 
     vkDestroyDevice(m_vk.device, nullptr);
     vkDestroySurfaceKHR(m_vk.instance, m_vk.surface, nullptr);

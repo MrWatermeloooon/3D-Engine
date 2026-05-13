@@ -21,6 +21,8 @@
 #include "jobs.h"
 #include "gpu_cull.h"
 #include "hzb.h"
+#include "raytracing.h"
+#include "dlss.h"
 
 class Engine {
 public:
@@ -59,6 +61,24 @@ private:
     IndirectBuffer     m_indirect;
     GpuCullData        m_gpuCull;
     HzbData            m_hzb;
+
+    // Ray tracing (Phase 1a: scaffolding only — no GPU work yet).
+    RtScene            m_rtScene;
+    RtSettings         m_rtSettings{};
+
+    // DLSS (Phase 4). `m_haltonIndex` cycles per frame to drive sub-pixel
+    // jitter; `m_currViewProj` / `m_dlssPrevViewProj` feed mesh.vert's motion
+    // vector calculation (separate from m_prevViewProj which is used by GPU
+    // cull's HZB projection — same value, kept distinct for clarity).
+    DlssSettings       m_dlssSettings{};
+    uint32_t           m_haltonIndex = 1;
+    glm::mat4          m_dlssPrevViewProj{1.0f};
+
+public:
+    RtSettings&   rtSettings()   { return m_rtSettings; }
+    DlssSettings& dlssSettings() { return m_dlssSettings; }
+
+private:
 
     // Previous frame's view-proj — fed to compute cull for HZB-space projection.
     // Identity on the very first frame; the HZB is cleared to depth=1.0 so

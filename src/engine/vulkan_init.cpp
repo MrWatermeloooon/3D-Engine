@@ -203,10 +203,88 @@ VkPhysicalDevice pickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface) {
 bool                                  VRS_SUPPORTED = false;
 PFN_vkCmdSetFragmentShadingRateKHR    VRS_SetRate   = nullptr;
 
+bool                                                 RT_SUPPORTED              = false;
+PFN_vkCreateAccelerationStructureKHR                 RT_CreateAS               = nullptr;
+PFN_vkDestroyAccelerationStructureKHR                RT_DestroyAS              = nullptr;
+PFN_vkGetAccelerationStructureBuildSizesKHR          RT_GetASBuildSizes        = nullptr;
+PFN_vkGetAccelerationStructureDeviceAddressKHR       RT_GetASDeviceAddress     = nullptr;
+PFN_vkCmdBuildAccelerationStructuresKHR              RT_CmdBuildAS             = nullptr;
+PFN_vkCmdWriteAccelerationStructuresPropertiesKHR    RT_CmdWriteASProps        = nullptr;
+PFN_vkGetBufferDeviceAddressKHR                      RT_GetBufferDeviceAddress = nullptr;
+
 // Returns true if the device exposes VK_KHR_fragment_shading_rate AND the
 // pipelineFragmentShadingRate feature. Attachment-based VRS (texel-rate image)
 // would also need attachmentFragmentShadingRate + a render-pass-2 migration;
 // we deliberately stop at pipeline/dynamic rate to keep render passes simple.
+// Probe RT support. Three extensions must be present AND both features
+// (accelerationStructure + rayQuery) must report VK_TRUE.
+//
+// We intentionally use ray *queries* (inline tracing from existing shaders)
+// rather than ray-tracing *pipelines* (rgen/rmiss/rchit + SBT). Ray queries
+// require strictly less machinery — no separate pipeline, no shader binding
+// table — and integrate directly into mesh.frag and any future GI compute
+// pass.
+struct RtProbe {
+    bool extPresent   = false;
+    bool asFeature    = false;
+    bool rqFeature    = false;
+    bool bdaFeature   = false; // bufferDeviceAddress, comes via VK12 features
+};
+
+static RtProbe probeRtSupport(VkPhysicalDevice physicalDevice) {
+    RtProbe out{};
+
+    uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> avail(count);
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, avail.data());
+
+    bool hasAS = false, hasRQ = false, hasDHO = false;
+    for (const auto& e : avail) {
+        std::string n = e.extensionName;
+        if (n == VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)    hasAS  = true;
+        if (n == VK_KHR_RAY_QUERY_EXTENSION_NAME)                 hasRQ  = true;
+        if (n == VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)  hasDHO = true;
+    }
+    out.extPresent = hasAS && hasRQ && hasDHO;
+    if (!out.extPresent) {
+        std::cout << "[VulkanEngine] RT probe: missing extension(s) —"
+                  << (hasAS  ? "" : " VK_KHR_acceleration_structure")
+                  << (hasRQ  ? "" : " VK_KHR_ray_query")
+                  << (hasDHO ? "" : " VK_KHR_deferred_host_operations")
+                  << "\n";
+        return out;
+    }
+
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeat{};
+    asFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    VkPhysicalDeviceRayQueryFeaturesKHR rqFeat{};
+    rqFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    asFeat.pNext = &rqFeat;
+
+    VkPhysicalDeviceVulkan12Features vk12{};
+    vk12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    rqFeat.pNext = &vk12;
+
+    VkPhysicalDeviceFeatures2 f2{};
+    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    f2.pNext = &asFeat;
+    vkGetPhysicalDeviceFeatures2(physicalDevice, &f2);
+
+    out.asFeature  = asFeat.accelerationStructure == VK_TRUE;
+    out.rqFeature  = rqFeat.rayQuery == VK_TRUE;
+    out.bdaFeature = vk12.bufferDeviceAddress == VK_TRUE;
+
+    if (!(out.asFeature && out.rqFeature && out.bdaFeature)) {
+        std::cout << "[VulkanEngine] RT probe: extensions present but feature(s) off —"
+                  << " accelerationStructure="  << out.asFeature
+                  << " rayQuery="               << out.rqFeature
+                  << " bufferDeviceAddress="    << out.bdaFeature
+                  << "\n";
+    }
+    return out;
+}
+
 static bool deviceSupportsVRS(VkPhysicalDevice physicalDevice) {
     uint32_t count = 0;
     vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, nullptr);
@@ -229,7 +307,8 @@ static bool deviceSupportsVRS(VkPhysicalDevice physicalDevice) {
     return vrsFeat.pipelineFragmentShadingRate == VK_TRUE;
 }
 
-VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyIndices& indices) {
+VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyIndices& indices,
+                             const std::vector<const char*>& extraExtensions) {
     std::vector<VkDeviceQueueCreateInfo> queueInfos;
     std::set<uint32_t> uniqueFamilies = {
         indices.graphicsFamily.value(),
@@ -255,6 +334,10 @@ VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyI
     vk12.descriptorBindingVariableDescriptorCount        = VK_TRUE;
     vk12.runtimeDescriptorArray                          = VK_TRUE;
     vk12.shaderSampledImageArrayNonUniformIndexing       = VK_TRUE;
+    // mesh.frag uses GL_EXT_scalar_block_layout + uint64_t (for buffer-
+    // reference pointer reconstruction) — both must be opted into at device
+    // creation or shader module creation fires validation errors.
+    vk12.scalarBlockLayout                               = VK_TRUE;
 
     // Optional VRS feature struct, chained only if the device supports it.
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR vrsFeat{};
@@ -263,17 +346,55 @@ VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyI
 
     const bool vrsSupported = deviceSupportsVRS(physicalDevice);
 
+    // Optional RT feature structs, chained only if the device supports them.
+    // Acceleration structures need bufferDeviceAddress on VK_KHR_buffer_device_address
+    // (a core 1.2 feature) — that's part of the vk12 struct.
+    RtProbe rtProbe = probeRtSupport(physicalDevice);
+    const bool rtSupported = rtProbe.extPresent && rtProbe.asFeature
+                          && rtProbe.rqFeature && rtProbe.bdaFeature;
+
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeat{};
+    asFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    asFeat.accelerationStructure = VK_TRUE;
+    VkPhysicalDeviceRayQueryFeaturesKHR rqFeat{};
+    rqFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rqFeat.rayQuery = VK_TRUE;
+
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &vk12;
     features2.features.samplerAnisotropy = VK_TRUE;
-    if (vrsSupported) {
-        vk12.pNext = &vrsFeat;
+    features2.features.shaderInt64       = VK_TRUE; // mesh.frag uint64_t
+
+    // Chain optional features into vk12.pNext. The chain looks like:
+    //   features2 → vk12 → [vrsFeat] → [asFeat → rqFeat]
+    void** tail = &vk12.pNext;
+    if (vrsSupported) { *tail = &vrsFeat; tail = &vrsFeat.pNext; }
+    if (rtSupported) {
+        // Enable bufferDeviceAddress on the existing vk12 struct (core 1.2).
+        vk12.bufferDeviceAddress = VK_TRUE;
+        *tail = &asFeat;  tail = &asFeat.pNext;
+        *tail = &rqFeat;  tail = &rqFeat.pNext;
     }
 
-    // Build the per-device extension list, copying base + optionally VRS.
+    // Build the per-device extension list, copying base + optionally VRS + RT.
     std::vector<const char*> deviceExts(DEVICE_EXTENSIONS.begin(), DEVICE_EXTENSIONS.end());
     if (vrsSupported) deviceExts.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+    if (rtSupported) {
+        deviceExts.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        deviceExts.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        deviceExts.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    }
+    // Caller-supplied extensions (e.g. those NGX requires for DLSS). Dedupe
+    // so we don't double-list anything already enabled above — validation
+    // would otherwise complain.
+    for (const char* e : extraExtensions) {
+        bool present = false;
+        for (const char* existing : deviceExts) {
+            if (std::strcmp(existing, e) == 0) { present = true; break; }
+        }
+        if (!present) deviceExts.push_back(e);
+    }
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -300,8 +421,43 @@ VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyI
             vkGetDeviceProcAddr(device, "vkCmdSetFragmentShadingRateKHR"));
         if (!VRS_SetRate) VRS_SUPPORTED = false;  // function load failed somehow
     }
+
+    RT_SUPPORTED = rtSupported;
+    if (RT_SUPPORTED) {
+        auto load = [&](const char* name, auto& out) {
+            out = reinterpret_cast<std::remove_reference_t<decltype(out)>>(
+                vkGetDeviceProcAddr(device, name));
+            if (out == nullptr) {
+                std::cout << "[VulkanEngine] RT load: missing " << name << "\n";
+                return false;
+            }
+            return true;
+        };
+        bool ok = true;
+        ok &= load("vkCreateAccelerationStructureKHR",                RT_CreateAS);
+        ok &= load("vkDestroyAccelerationStructureKHR",               RT_DestroyAS);
+        ok &= load("vkGetAccelerationStructureBuildSizesKHR",         RT_GetASBuildSizes);
+        ok &= load("vkGetAccelerationStructureDeviceAddressKHR",      RT_GetASDeviceAddress);
+        ok &= load("vkCmdBuildAccelerationStructuresKHR",             RT_CmdBuildAS);
+        ok &= load("vkCmdWriteAccelerationStructuresPropertiesKHR",   RT_CmdWriteASProps);
+        // GetBufferDeviceAddress is core 1.2, but also exposed under the KHR
+        // alias; prefer the core symbol and fall back to the KHR alias.
+        RT_GetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddressKHR>(
+            vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddress"));
+        if (!RT_GetBufferDeviceAddress) {
+            RT_GetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddressKHR>(
+                vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddressKHR"));
+        }
+        if (!RT_GetBufferDeviceAddress) {
+            std::cout << "[VulkanEngine] RT load: missing vkGetBufferDeviceAddress[KHR]\n";
+            ok = false;
+        }
+        if (!ok) RT_SUPPORTED = false;
+    }
+
     std::cout << "[VulkanEngine] Logical device created"
               << (VRS_SUPPORTED ? " (VRS supported)" : " (VRS unavailable)")
+              << (RT_SUPPORTED  ? " (RT supported)"  : " (RT unavailable)")
               << "\n";
     return device;
 }

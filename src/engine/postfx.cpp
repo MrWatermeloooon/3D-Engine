@@ -112,6 +112,14 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
     t.colorView = createImageView(device, t.colorImage.image, t.colorFormat,
                                   VK_IMAGE_ASPECT_COLOR_BIT, 1);
 
+    // Motion vectors: RG16F. Color attachment + sampleable by DLSS.
+    t.motionImage = createImage(physicalDevice, device, extent.width, extent.height, 1,
+        t.motionFormat, VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    t.motionView = createImageView(device, t.motionImage.image, t.motionFormat,
+                                   VK_IMAGE_ASPECT_COLOR_BIT, 1);
+
     // Depth: depthFormat, sampleable
     t.depthImage = createImage(physicalDevice, device, extent.width, extent.height, 1,
         depthFormat, VK_IMAGE_TILING_OPTIMAL,
@@ -120,8 +128,9 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
     t.depthView = createImageView(device, t.depthImage.image, depthFormat,
                                   VK_IMAGE_ASPECT_DEPTH_BIT, 1);
 
-    // Render pass: color → SHADER_READ, depth → DEPTH_STENCIL_READ_ONLY
-    VkAttachmentDescription atts[2]{};
+    // Render pass: 2 color attachments (color + motion) → SHADER_READ,
+    // depth → DEPTH_STENCIL_READ_ONLY.
+    VkAttachmentDescription atts[3]{};
     atts[0].format         = t.colorFormat;
     atts[0].samples        = VK_SAMPLE_COUNT_1_BIT;
     atts[0].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -131,22 +140,33 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
     atts[0].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
     atts[0].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    atts[1].format         = depthFormat;
+    atts[1].format         = t.motionFormat;
     atts[1].samples        = VK_SAMPLE_COUNT_1_BIT;
     atts[1].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
     atts[1].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
     atts[1].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     atts[1].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-    atts[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    atts[1].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkAttachmentReference colorRef{}; colorRef.attachment = 0; colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    VkAttachmentReference depthRef{}; depthRef.attachment = 1; depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    atts[2].format         = depthFormat;
+    atts[2].samples        = VK_SAMPLE_COUNT_1_BIT;
+    atts[2].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[2].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[2].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[2].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[2].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+    VkAttachmentReference colorRefs[2]{};
+    colorRefs[0].attachment = 0; colorRefs[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorRefs[1].attachment = 1; colorRefs[1].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference depthRef{}; depthRef.attachment = 2; depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkSubpassDescription sub{};
     sub.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount    = 1;
-    sub.pColorAttachments       = &colorRef;
+    sub.colorAttachmentCount    = 2;
+    sub.pColorAttachments       = colorRefs;
     sub.pDepthStencilAttachment = &depthRef;
 
     VkSubpassDependency deps[2]{};
@@ -170,7 +190,7 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
 
     VkRenderPassCreateInfo rp{};
     rp.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    rp.attachmentCount = 2;
+    rp.attachmentCount = 3;
     rp.pAttachments    = atts;
     rp.subpassCount    = 1;
     rp.pSubpasses      = &sub;
@@ -178,11 +198,11 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
     rp.pDependencies   = deps;
     VK_CHECK(vkCreateRenderPass(device, &rp, nullptr, &t.renderPass));
 
-    VkImageView attsView[] = { t.colorView, t.depthView };
+    VkImageView attsView[] = { t.colorView, t.motionView, t.depthView };
     VkFramebufferCreateInfo fb{};
     fb.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fb.renderPass      = t.renderPass;
-    fb.attachmentCount = 2;
+    fb.attachmentCount = 3;
     fb.pAttachments    = attsView;
     fb.width           = extent.width;
     fb.height          = extent.height;
@@ -199,10 +219,15 @@ void destroyOffscreenTarget(VkDevice device, OffscreenTarget& t) {
     if (t.framebuffer)  vkDestroyFramebuffer(device, t.framebuffer, nullptr);
     if (t.renderPass)   vkDestroyRenderPass(device, t.renderPass, nullptr);
     if (t.colorView)    vkDestroyImageView(device, t.colorView, nullptr);
+    if (t.motionView)   vkDestroyImageView(device, t.motionView, nullptr);
     if (t.depthView)    vkDestroyImageView(device, t.depthView, nullptr);
     if (t.colorImage.image) {
         vkDestroyImage(device, t.colorImage.image, nullptr);
         vkFreeMemory(device, t.colorImage.memory, nullptr);
+    }
+    if (t.motionImage.image) {
+        vkDestroyImage(device, t.motionImage.image, nullptr);
+        vkFreeMemory(device, t.motionImage.memory, nullptr);
     }
     if (t.depthImage.image) {
         vkDestroyImage(device, t.depthImage.image, nullptr);

@@ -13,7 +13,9 @@ Frustum extractFrustum(const glm::mat4& m) {
     f.planes[1] = r3 - r0; // right
     f.planes[2] = r3 + r1; // bottom (or top, depending on Y convention)
     f.planes[3] = r3 - r1; // top
-    f.planes[4] = r3 + r2; // near (Vulkan: z=0)
+    // Vulkan / GLM_FORCE_DEPTH_ZERO_TO_ONE clip space: z ∈ [0, w].
+    // Near plane equation is `z ≥ 0` (NOT `z + w ≥ 0` like OpenGL).
+    f.planes[4] = r2;      // near
     f.planes[5] = r3 - r2; // far
 
     for (auto& p : f.planes) {

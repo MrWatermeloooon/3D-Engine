@@ -150,13 +150,38 @@ static void createCascadeBuffers(ShadowData& s, VkPhysicalDevice physicalDevice,
 }
 
 void createShadowResources(ShadowData& shadow, VkPhysicalDevice physicalDevice,
-                           VkDevice device, uint32_t framesInFlight)
+                           VkDevice device, VkCommandPool commandPool, VkQueue queue,
+                           uint32_t framesInFlight)
 {
     createShadowImage(shadow, physicalDevice, device);
     createShadowRenderPass(shadow, device);
     createShadowFramebuffers(shadow, device);
     createShadowSampler(shadow, device);
     createCascadeBuffers(shadow, physicalDevice, device, framesInFlight);
+
+    // The shadow render pass transitions from UNDEFINED → READ_ONLY_OPTIMAL
+    // when it runs. When RT shadows are on (default), that pass is skipped,
+    // so the image would sit in UNDEFINED and trip validation on every draw
+    // that binds the descriptor. Do a one-shot transition up front so the
+    // descriptor is always valid regardless of which shadow path is active.
+    VkCommandBuffer cmd = beginSingleTimeCommands(device, commandPool);
+    VkImageMemoryBarrier b{};
+    b.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout        = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image            = shadow.image;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = SHADOW_CASCADE_COUNT;
+    b.srcAccessMask    = 0;
+    b.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &b);
+    endSingleTimeCommands(device, commandPool, queue, cmd);
 }
 
 void destroyShadowResources(VkDevice device, ShadowData& shadow) {
@@ -245,9 +270,17 @@ void computeCascades(ShadowData& shadow, uint32_t frameIndex,
         centerLS.y = std::floor(centerLS.y / worldUnitsPerTexel) * worldUnitsPerTexel;
         glm::vec3 snappedCenter = glm::vec3(glm::inverse(lightViewUnsnapped) * glm::vec4(centerLS, 1.0f));
 
-        glm::mat4 lightView = glm::lookAt(snappedCenter - ldir * radius, snappedCenter, up);
+        // Pull the light origin further back along -ldir so casters above/behind
+        // the receiving bounding sphere (tall pillars, terrain features outside
+        // the view frustum) are still inside the ortho depth range. Without this
+        // extension the ortho near plane sits at the front of the sphere and
+        // clips out any caster between it and the light, producing the classic
+        // "shadow disappears as you change angles" bug.
+        const float zExtend = radius * 10.0f;
+        glm::mat4 lightView = glm::lookAt(snappedCenter - ldir * (radius + zExtend),
+                                          snappedCenter, up);
         glm::mat4 lightProj = glm::ortho(-radius, radius, -radius, radius,
-                                         0.0f, radius * 2.0f);
+                                         0.0f, radius * 2.0f + zExtend);
 
         outUbo.lightViewProj[c] = lightProj * lightView;
         outUbo.splitsViewSpace[c] = -(nearClip + splitDist * clipRange);
