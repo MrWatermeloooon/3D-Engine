@@ -16,7 +16,7 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Mesh LOD groups with compute-side LOD selection and per-LOD indirect draw slots.
 - Bindless texture array with descriptor indexing and update-after-bind support.
 - Hardware ray tracing path with BLAS/TLAS builds, Vulkan ray queries, ray-traced shadows, reflections, and one-bounce GI.
-- DLSS Super Resolution path with NGX feature creation/evaluation, optimal render-size selection, Halton jitter, motion vectors, and full-resolution upscale output.
+- Motion-vector render target and scene jitter scaffolding for future TAA or upscaling work.
 - Job system with fire-and-forget tasks, blocking `parallel_for`, and frame-work barriers.
 - Variable-rate shading support through `VK_KHR_fragment_shading_rate`, with per-LOD rates and UI override when available.
 - Entity/component scene structure using EnTT.
@@ -45,9 +45,9 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - HZB now builds at half offscreen resolution to match the reducer shader and avoid screen-position-dependent false occlusion.
 - Ray-traced shadows can replace the CSM shadow pass, with the shadow image still transitioned so descriptors remain valid.
 - RT reflections and GI reuse mesh device addresses and material data to shade ray hits with interpolated normals and sun visibility.
-- DLSS render-scale plumbing now rebuilds offscreen, bloom, SSAO, composite, LDR, and HZB resources at the NGX optimal input size while presenting through a full-resolution upscale target.
-- FXAA now reads from the DLSS upscale target when DLSS is active, otherwise from the normal LDR target.
-- Motion-vector rendering writes a second RG16F attachment for DLSS, with blend state mirrored to avoid validation warnings.
+- Motion-vector rendering writes a second RG16F attachment, with matching blend state to avoid validation warnings.
+- SSAO is filtered with a 4x4 box average in the composite pass to remove visible stippled noise.
+- RT shadows now handle non-directional-only scenes correctly by allowing point and spot lights to cast shadows when no directional light exists.
 
 ## Tech Stack
 
@@ -84,7 +84,6 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Ninja build system.
 - vcpkg installed with `VCPKG_ROOT` set.
 - A GPU and driver with Vulkan support.
-- NVIDIA DLSS SDK cloned locally to `DLSS_SDK/` for DLSS-enabled builds. The SDK is intentionally ignored by Git because it contains large third-party binaries.
 
 ## Build
 
@@ -117,8 +116,6 @@ After building, run the generated `VulkanEngine` executable from the build outpu
 
 The repository intentionally ignores local build output, Visual Studio metadata, compiled SPIR-V files, and the Vulkan SDK installer. Install the Vulkan SDK locally instead of committing the installer into Git.
 
-The local `DLSS_SDK/` checkout is also ignored. Clone or install NVIDIA's DLSS SDK into that folder before configuring if you want to build the DLSS integration.
-
 If a Windows build fails with `LNK1168`, another program may be holding the executable open. Close capture/overlay tools such as Medal, OBS, or Overwolf, then rebuild.
 
 ## Future Additions
@@ -132,6 +129,7 @@ If a Windows build fails with `LNK1168`, another program may be holding the exec
 
 ### RTX / Ray Tracing
 
+- DLSS or Streamline upscaling: revisit AI upscaling later using the existing motion-vector scaffold, preferably without a hard NGX SDK dependency.
 - Previous per-instance transforms for true object motion vectors instead of camera-only motion.
 - Denoising and temporal accumulation for cleaner ray-traced GI and glossy reflections.
 

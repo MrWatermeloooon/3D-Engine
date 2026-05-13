@@ -5,7 +5,6 @@
 #include "shadow.h"
 #include "postfx.h"
 #include "raytracing.h"
-#include "dlss.h"
 #include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
@@ -116,7 +115,7 @@ static const char* lightTypeName(entt::registry& reg, entt::entity e) {
 
 void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
                       Camera& camera, ShadowData& shadow, PostFXSettings& postfx,
-                      RtSettings& rt, DlssSettings& dlss,
+                      RtSettings& rt,
                       int visibleEntities, int totalEntities,
                       float deltaTime)
 {
@@ -172,7 +171,6 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
         ImGui::DockBuilderDockWindow("Post-Processing",  dockBottom);
         ImGui::DockBuilderDockWindow("Shadows (CSM)",    dockBottom);
         ImGui::DockBuilderDockWindow("Ray Tracing",      dockBottom);
-        ImGui::DockBuilderDockWindow("DLSS",             dockBottom);
         ImGui::DockBuilderDockWindow("Camera",           dockBottom);
         ImGui::DockBuilderFinish(dockId);
     }
@@ -543,35 +541,6 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             ImGui::SliderFloat("GI max dist", &rt.giMaxDist, 5.0f, 100.0f, "%.0f");
             ImGui::SliderFloat("GI mix (0=smooth, 1=full RT)", &rt.giIntensity, 0.0f, 1.0f);
             ImGui::EndDisabled();
-            ImGui::EndDisabled();
-        }
-    }
-    ImGui::End();
-
-    // ── DLSS ────────────────────────────────────────────────────────────
-    if (ImGui::Begin("DLSS")) {
-        if (!dlssAvailable()) {
-            ImGui::TextDisabled("DLSS unavailable. See console for NGX init details.");
-        } else {
-            ImGui::Text("DLSS Super Sampling: ready");
-            ImGui::Separator();
-            ImGui::Checkbox("Enable DLSS", &dlss.enabled);
-            ImGui::TextDisabled("Phase 4b: jitter + scaffolding active; upscale pass lands in 4c.");
-            ImGui::BeginDisabled(!dlss.enabled);
-            ImGui::Checkbox("Sub-pixel jitter", &dlss.jitterEnabled);
-            ImGui::TextDisabled("Halton(2,3) 8-frame cycle on the camera proj.");
-            const char* presets[] = {
-                "Performance (50%)", "Balanced (58%)", "Quality (66%)",
-                "Ultra Performance (33%)", "DLAA (100%)"
-            };
-            // DlssQuality enum values 0..4 happen to map cleanly to the
-            // presets order above when treated as indices via static_cast.
-            int q = static_cast<int>(dlss.quality);
-            // Clamp into the enum range for the combo (UltraPerformance=3, DLAA=4).
-            q = std::max(0, std::min(4, q));
-            if (ImGui::Combo("Preset", &q, presets, IM_ARRAYSIZE(presets))) {
-                dlss.quality = static_cast<DlssQuality>(q);
-            }
             ImGui::EndDisabled();
         }
     }

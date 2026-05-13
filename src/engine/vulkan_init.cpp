@@ -385,7 +385,7 @@ VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyI
         deviceExts.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
         deviceExts.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     }
-    // Caller-supplied extensions (e.g. those NGX requires for DLSS). Dedupe
+    // Caller-supplied extensions for optional integrations. Dedupe
     // so we don't double-list anything already enabled above — validation
     // would otherwise complain.
     for (const char* e : extraExtensions) {

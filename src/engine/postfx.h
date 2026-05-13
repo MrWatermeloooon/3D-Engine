@@ -16,7 +16,7 @@ struct OffscreenTarget {
     AllocatedImage colorImage;
     VkImageView    colorView    = VK_NULL_HANDLE;
     // Motion vectors — written as 2nd color attachment by mesh.frag. NDC-space
-    // (prev - curr) in [-1, 1] units. Consumed by DLSS (4c).
+    // (prev - curr) in [-1, 1] units. Kept for future TAA/upscalers.
     AllocatedImage motionImage;
     VkImageView    motionView   = VK_NULL_HANDLE;
     AllocatedImage depthImage;
@@ -88,22 +88,6 @@ struct LdrTarget {
     VkExtent2D     extent{};
     VkFormat       format      = VK_FORMAT_R8G8B8A8_UNORM;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE; // used by FXAA pass
-};
-
-// ── DLSS upscale target (DLSS output, FXAA input when DLSS is on) ───────────
-//
-// Always sized to the swapchain extent. The image is written by NGX as a
-// storage image (VK_IMAGE_LAYOUT_GENERAL) and sampled by the FXAA pipeline as
-// a regular shader read. We toggle the layout with barriers around the DLSS
-// evaluate call.
-struct UpscaleTarget {
-    AllocatedImage image;
-    VkImageView    view        = VK_NULL_HANDLE;
-    VkSampler      sampler     = VK_NULL_HANDLE;
-    VkExtent2D     extent{};
-    VkFormat       format      = VK_FORMAT_R8G8B8A8_UNORM;
-    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;   // FXAA reads here when DLSS is on
-    bool           wasInitialised = false;            // tracks if image has been touched
 };
 
 // ── Settings (UI-driven) ────────────────────────────────────────────────────
@@ -196,15 +180,10 @@ void createLdrTarget(LdrTarget& t, VkPhysicalDevice physicalDevice, VkDevice dev
                      VkExtent2D extent);
 void destroyLdrTarget(VkDevice device, LdrTarget& t);
 
-void createUpscaleTarget(UpscaleTarget& t, VkPhysicalDevice physicalDevice, VkDevice device,
-                         VkExtent2D extent);
-void destroyUpscaleTarget(VkDevice device, UpscaleTarget& t);
-
 void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloom,
                            SSAOTarget& ssao, CompositeData& composite, LdrTarget& ldr,
                            OffscreenTarget& offscreen, VkRenderPass swapchainPass,
-                           uint32_t framesInFlight,
-                           UpscaleTarget* upscale = nullptr);
+                           uint32_t framesInFlight);
 void destroyPostFXPipelines(VkDevice device, PostFXPipelines& p);
 
 // Per-frame updates

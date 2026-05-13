@@ -77,7 +77,7 @@ layout(set = 0, binding = 5, std430) readonly buffer RtMaterialsBuffer {
 layout(set = 1, binding = 0) uniform sampler2D bindlessTextures[];
 
 layout(location = 0) out vec4 outColor;
-// Motion vector for DLSS. NDC-space (prev - curr), jitter removed.
+// Motion vector for future TAA/upscalers. NDC-space (prev - curr), jitter removed.
 // Computed from vWorldPos so it works for both static and skinned meshes
 // without per-instance previous-transform plumbing — at the cost of object
 // motion not being captured (only camera motion).
@@ -560,12 +560,21 @@ void main() {
 
     // ── Motion vector ────────────────────────────────────────────────────
     // Reproject this fragment through both the current and previous-frame
-    // view-projection. Output (prevNDC - currNDC) in NDC units. Subtract
-    // the camera jitter from the current sample so the motion only encodes
-    // real motion, not sub-pixel jitter.
+    // view-projection. Output (prevNDC - currNDC) in NDC units.
+    //
+    // The camera proj has had `+jitterNDC` added to proj[2][0]/[2][1]; the
+    // perspective W-divide turns that into a NDC shift of `-jitterNDC`. So:
+    //   jittered_NDC = unjittered_NDC - jitterNDC
+    // To recover the unjittered position, *add* jitterOffset back. (Subtracting
+    // it — as a previous version did — actually doubles the jitter and
+    // produces a per-frame shake on static geometry.)
+    //
+    // scene.prevViewProj is the UN-jittered previous-frame view×proj (set
+    // engine-side from the camera matrices, not from the jittered ubo.proj),
+    // so prevNDC is already unjittered — no correction needed there.
     vec4 currClip = scene.proj * scene.view * vec4(vWorldPos, 1.0);
     vec4 prevClip = scene.prevViewProj         * vec4(vWorldPos, 1.0);
-    vec2 currNDC = currClip.xy / currClip.w - scene.jitterOffset.xy;
+    vec2 currNDC = currClip.xy / currClip.w + scene.jitterOffset.xy;
     vec2 prevNDC = prevClip.xy / prevClip.w;
     outMotion = prevNDC - currNDC;
 }

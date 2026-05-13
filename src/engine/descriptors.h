@@ -24,10 +24,10 @@ struct UniformBufferObject {
     // z = GI max ray distance
     // w = GI intensity multiplier
     alignas(16) glm::vec4 rtParams3{0.0f};
-    // Previous-frame view-projection. Used by mesh.vert to compute motion
-    // vectors for DLSS / TAA. Identity on the first frame.
+    // Previous-frame view-projection. Used by mesh.frag to compute motion
+    // vectors for future TAA/upscalers. Identity on the first frame.
     alignas(16) glm::mat4 prevViewProj{1.0f};
-    // Sub-pixel jitter offset applied to the camera proj (DLSS).
+    // Sub-pixel jitter offset applied to the camera projection when enabled.
     //   .xy = current frame jitter in NDC units (already baked into proj —
     //         shaders use these to subtract jitter when reconstructing motion).
     //   .zw = reserved.

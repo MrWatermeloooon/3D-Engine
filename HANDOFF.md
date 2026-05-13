@@ -12,10 +12,13 @@ pick up without reading the prior conversation.
 - Ninja (bundled with VS)
 - vcpkg at `C:\vcpkg`
 - Vulkan SDK 1.4.341.1 at `C:\VulkanSDK\1.4.341.1` (for `glslc`)
-- **NVIDIA DLSS SDK at `DLSS_SDK/`** (in the project root). Cloned from
-  https://github.com/NVIDIA/DLSS. Build will hard-fail at link step without it.
-  The `dev/nvngx_dlss.dll` is copied next to the exe post-build.
-- GPU driver: NVIDIA 555+ for DLSS 310.x SDK. Tested on driver 591.86 / RTX 5070 Ti.
+- GPU driver: tested on driver 591.86 / RTX 5070 Ti. RT path needs a driver
+  that exposes `VK_KHR_acceleration_structure` + `VK_KHR_ray_query`.
+
+DLSS is no longer integrated — `DLSS_SDK/` checkout is **not** required to
+build any more. (It can stay on disk; CMake doesn't reference it.) When
+adding DLSS back via Streamline, see "DLSS (removed)" below for the
+existing scaffolding hooks.
 
 **Configure + build** (from a VS dev shell or via the helper batch pattern the
 prior chats used — `vcvars64.bat` first, then):
@@ -29,7 +32,7 @@ cmake --build build
 ```
 
 **Run**: `build/VulkanEngine.exe`. Working directory must be `build/` so the
-relative `shaders/*.spv` and `nvngx_dlss.dll` paths resolve.
+relative `shaders/*.spv` paths resolve.
 
 > ⚠️ **LNK1168 — locked exe.** Medal recorder, OBS hook, and Overwolf overlay
 > all install Vulkan layers that sometimes hold a handle on the exe after the
@@ -46,11 +49,7 @@ relative `shaders/*.spv` and `nvngx_dlss.dll` paths resolve.
 `imgui` (features: `glfw-binding`, `vulkan-binding`, `docking-experimental`),
 `imguizmo`. All header-only or thin libs.
 
-**Not via vcpkg**:
-- NVIDIA NGX SDK lives at `DLSS_SDK/` (manually cloned). Linked from
-  `DLSS_SDK/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib` (Debug) /
-  `nvsdk_ngx_d.lib` (Release). CMake picks per-config via generator
-  expression — mismatching CRT iterator level causes LNK2038.
+No non-vcpkg dependencies.
 
 ## Compile-time defines
 
@@ -69,7 +68,6 @@ support).
 ## Project Layout
 
 ```
-DLSS_SDK/                      # NVIDIA NGX SDK (cloned, NOT vcpkg)
 src/
   main.cpp                    # entry, owns one Engine, calls init/run/cleanup
   utils/vk_check.h            # VK_CHECK macro
@@ -101,7 +99,6 @@ src/
     gpu_cull.{h,cpp}          # compute-cull pipeline, params UBO, dispatch helper
     hzb.{h,cpp}               # hierarchical Z-buffer (occlusion culling source)
     raytracing.{h,cpp}        # BLAS/TLAS build, RtSettings, RtInstanceMaterial
-    dlss.{h,cpp}              # NGX init/shutdown, Halton jitter, DlssSettings
 
 shaders/
   fullscreen.vert             # full-screen triangle from gl_VertexIndex
@@ -183,6 +180,11 @@ Two paths gated by `RtSettings::shadows`:
   via cone-sampling (`rtSettings.shadowSoftness` = light angular radius),
   `rtSettings.shadowSamples` rays per light per fragment (default 16).
   Sun-only toggle for CSM parity.
+- **Effective sun-only** is auto-overridden to `false` when no directional
+  light exists in the scene. The shader's RT-shadow branch only traces a
+  ray for "the first directional light" when sunOnly is true, so a scene
+  with only point/spot lights would otherwise have zero shadows. Engine
+  detects this and drops sunOnly to false so per-light shadow rays fire.
 
 Shadow image is **transitioned to `DEPTH_STENCIL_READ_ONLY_OPTIMAL` once at
 creation** in `shadow.cpp::createShadowResources` so the descriptor binding
@@ -231,58 +233,43 @@ is valid even when the shadow pass never runs (RT-shadows-only case).
   the mix is the trade-off knob.
 - Skipped for metallics (their indirect is purely specular reflection).
 
-### DLSS (Phase 4, partial)
+### DLSS (removed)
 
-**Step 4a (complete).**
-- `dlss.{h,cpp}` wraps NGX. `dlssInit` calls `NVSDK_NGX_VULKAN_Init_with_ProjectID`
-  with a **UUID-format** project ID (NGX rejects free-form strings via
-  `NGXValidateIdentifier`).
-- `dlssRequiredInstanceExtensions` / `dlssRequiredDeviceExtensions` query
-  NGX for the extensions it needs *before* instance/device creation. Engine
-  init walks them and merges into the extension lists.
-- Path list + log directory set via `NVSDK_NGX_FeatureCommonInfo`. NGX
-  writes its own log to `build/dlss_logs/nvsdk_ngx.log`. Console mirror is
-  silenced.
-- Capability probed via `NVSDK_NGX_Parameter_SuperSampling_Available`.
-- Console prints `[DLSS] NGX initialised, DLSS Super Sampling available`
-  on success.
+Phase 4 (direct NGX integration) was implemented and then **removed**. The
+direct-NGX path repeatedly hit `VK_IMAGE_LAYOUT_UNDEFINED` validation errors
+on NGX's internal scratch images after multiple feature recreates, made the
+scene more blurry rather than less (post-LDR placement) or slower (HDR
+pre-composite placement), and didn't deliver an FPS uplift at 1280×720
+with a light scene. Plan is to revisit via NVIDIA's **Streamline** SDK
+(https://github.com/NVIDIA-RTX/Streamline) when the integration becomes
+worthwhile again.
 
-**Step 4b (foundation in place, motion vectors in flight).**
-- `DlssSettings` (enabled / quality preset / jitterEnabled).
-- `haltonJitter(index)` produces a Halton(2,3) offset in `[-0.5, +0.5]`.
-- Engine applies sub-pixel jitter to the camera proj (`ubo.proj[2][0/1] +=
-  jitterNDC`) when DLSS is on.
-- `SceneUBO` gained `prevViewProj` (mat4) and `jitterOffset` (vec4). Each
-  GLSL stage that declares the UBO must list them in matching order or the
-  std140 layout breaks — see "Key conventions".
-- **Motion vectors render target** added to `OffscreenTarget` as RG16F
-  second color attachment. Render pass has 3 attachments now (color, motion,
-  depth). Main + skinned pipelines both declare 2 color blend states.
-- `mesh.frag` writes `(prevNDC - currNDC)` to attachment 1, with the jitter
-  offset subtracted from `currNDC` so motion encodes only real motion.
-
-**Step 4c (complete).** `dlssCreateFeature` / `dlssEvaluate` /
-`dlssGetOptimalRenderSize` / `dlssReleaseFeature` wrap the NGX entry points.
-`Engine::computeRenderExtent` picks the offscreen extent: full swapchain
-extent when DLSS is off, NGX-reported optimal input size when on. Offscreen,
-bloom, SSAO, composite, LDR, and HZB are all built at this `m_renderExtent`;
-only the new `UpscaleTarget m_upscale` and the swapchain itself live at full
-resolution. Toggling DLSS / changing the quality preset is detected at the
-top of each frame, triggering `recreateSwapchain()` + `rebuildDlssFeatureIfNeeded()`
-in one shot. The renderer inserts a DLSS evaluate between composite and FXAA
-when a feature is alive: LDR (low-res, SHADER_READ_ONLY) → upscale (full-res,
-GENERAL→SHADER_READ_ONLY), with motion + depth fed from the offscreen pass.
-FXAA samples from `m_upscale.descriptorSet` instead of `m_ldr.descriptorSet`
-when DLSS is active. Camera jitter is computed against `m_renderExtent`
-(input pixels), and the same Halton offset is forwarded to NGX as
-`InJitterOffsetX/Y` in input-pixel space.
+What remains in the codebase as scaffolding for a future Streamline / TAA
+integration:
+- `haltonJitter(index)` helper is **gone** but trivial to re-add.
+- `SceneUBO::prevViewProj` and `SceneUBO::jitterOffset` are still present
+  (still in shader UBO declarations).
+- Engine still saves `m_prevViewProjMotion = currViewProj` (un-jittered)
+  per frame and forwards it through `ubo.prevViewProj`.
+- `OffscreenTarget` still has a `motionImage` RG16F attachment, and
+  `mesh.frag` still writes `(prevNDC - currNDC)` into it. The motion
+  vector is correct for camera-only motion (per-instance motion is not
+  yet tracked).
+- No jitter is currently applied to the projection (`ubo.jitterOffset =
+  vec4(0)`). When jitter is re-enabled, the shader needs to **add**
+  `jitterOffset.xy` to currNDC (not subtract) — adding to `proj[2][0/1]`
+  shifts NDC by `-jitterNDC` due to the W-divide.
 
 ### Post-FX
 
 - HDR offscreen (`RGBA16F`) **+ motion vectors (`R16G16_SFLOAT`)** + sampleable depth
 - Bloom: 4-mip downsample/upsample chain
 - **SSAO** auto-suppressed when RT shadows are active (RT GI replaces it).
-  When RT is off, SSAO runs normally.
+  When RT is off, SSAO runs normally. **The composite pass blurs the SSAO
+  output with a 4×4 box filter** (16 bilinear taps in `composite.frag`)
+  to denoise the stippled pattern produced by the 4×4 random-kernel-rotation
+  noise texture. Without this, soft AO regions look "grainy" / "pixelated";
+  with it, the AO is visually smooth at negligible cost.
 - Composite: ACES/Reinhard/Off tonemap, color lift, saturation, contrast, vignette
 - FXAA 3.11 lite
 
@@ -304,8 +291,6 @@ New panels added:
   reflections / GI), sun-only checkbox, shadow softness + samples,
   reflection samples / max-dist / intensity, GI samples / max-dist /
   intensity (= mix factor).
-- **DLSS** — master enable, sub-pixel jitter toggle, quality preset combo.
-  Visible only if DLSS init succeeded.
 
 ### Camera, Skeletal — unchanged
 
@@ -355,9 +340,8 @@ layout(set = 0, binding = 0) uniform SceneUBO {
 
 - `VRS_SUPPORTED` — `VK_KHR_fragment_shading_rate` available
 - `RT_SUPPORTED` — three RT extensions + features
-- `dlssAvailable()` — NGX init succeeded and DLSS Super Sampling is offered
 
-All three guard their code paths defensively. The engine boots and runs
+Both guard their code paths defensively. The engine boots and runs
 cleanly with any combination off.
 
 ### Descriptor sets
@@ -380,34 +364,11 @@ cleanly with any combination off.
 
 ### Texture coordinates / camera projection — unchanged
 
-### DLSS project ID format
-
-NGX validates the project ID and rejects anything non-UUID. The engine uses
-a hardcoded UUID `5b7e8f4a-2c9d-4e3f-a1b6-c8d7e9f0a1b2`. Replace with a
-registered UUID when shipping with the release-signed DLL.
-
 ## Default scene — unchanged
 
 Sun + warm fill point light + steel/red/gold spinning cubes + floor.
 
 ## Known issues / deferred work
-
-### DLSS upscale runs at LDR (post-tonemap), not HDR
-
-The current placement (per the original handoff plan) feeds DLSS a
-tonemapped, gamma-corrected LDR image from the composite pass — not the
-canonical HDR pre-composite input NVIDIA recommends. This loses some
-quality (DLSS' internal exposure heuristics and temporal accumulation are
-tuned for HDR linear input) but keeps the pipeline simple: a single
-DLSS pass slots in cleanly between composite and FXAA, and bloom/SSAO/
-composite all run unchanged at the low render extent.
-
-To switch to HDR DLSS: move the DLSS pass to run between the main pass
-and SSAO/bloom, write its output into a full-res HDR image, and rebuild
-the bloom/SSAO/composite chain at full resolution off that image (or
-keep them at low res and accept the bandwidth — common). The
-`NVSDK_NGX_DLSS_Feature_Flags_IsHDR` create flag needs to be set in
-`dlssCreateFeature` too.
 
 ### Per-instance previous transform not tracked
 
@@ -454,21 +415,12 @@ it in `mesh.frag::main`'s motion vector computation.
 - For very rough metals, `roughness >= 0.85` skips the trace entirely —
   noise would dominate the contribution.
 
-### DLSS-specific gotchas
-- NGX dev DLL bypasses app allowlisting; the release DLL would need a
-  registered project ID with NVIDIA.
-- Debug build links `nvsdk_ngx_d_dbg.lib`, release links `nvsdk_ngx_d.lib`.
-  CRT iterator levels must match.
-- Locked-exe LNK1168 is the most common build failure since the Overwolf /
-  Medal / OBS Vulkan layers cling to handles.
-
 ## File-by-file index of significant entry points
 
 - **Engine startup**: `Engine::init()` in `engine.cpp`. Order is
   important — RT extension queries happen *before* instance and device
-  creation; DLSS extension queries happen between instance + device creation;
-  `dlssInit` happens right after device creation; `createShadowResources` now
-  also takes a command pool + queue for the initial layout transition.
+  creation. `createShadowResources` takes a command pool + queue for the
+  initial layout transition.
 - **Per-frame draw**: `drawFrame()` in `renderer.cpp`. Reads `DrawFrameInfo`,
   builds TLAS, dispatches cull, optionally skips shadow pass when RT shadows
   active, records main pass (now 3 attachments), HZB reduce, SSAO, bloom,
@@ -480,7 +432,6 @@ it in `mesh.frag::main`'s motion vector computation.
   `mesh.cpp::uploadMesh` when `RT_SUPPORTED`.
 - **TLAS build**: `buildTlas()` in `raytracing.cpp`. Issues pre-build
   HOST_WRITE → AS_WRITE barrier and post-build AS_WRITE → SHADER_READ.
-- **NGX init**: `dlssInit` in `dlss.cpp`.
 - **Swapchain rebuild**: `Engine::recreateSwapchain()` — rebuilds offscreen
   (which now includes the motion image), HZB at half-extent, all post-fx.
 - **Shadow cascade math**: `computeCascades()` in `shadow.cpp` — `zExtend
@@ -512,16 +463,18 @@ it in `mesh.frag::main`'s motion vector computation.
 
 ## Last-known-good build state
 
-- Last successful build linked `VulkanEngine.exe` with Phase 1, 2, 3 and
-  the full Step 4a/4b/4c stack. DLSS off-path renders identically to
-  Phase 3 (full-res offscreen, no jitter, FXAA samples LDR). DLSS on-path
-  renders the offscreen at the NGX-reported optimal input size, runs
-  DLSS into `m_upscale`, and routes FXAA from there.
-- Shader count: 12 (same as before — no new shader files added; existing
-  mesh.frag grew substantially).
+- DLSS removed. Engine boots cleanly without `nvngx_dlss.dll` or any
+  NGX SDK. Console no longer prints `[DLSS]` lines.
+- Phase 1/2/3 (RT shadows, reflections, GI) intact.
+- SSAO denoise blur active in composite — no more stippled AO grain.
+- RT shadows fall back to per-light when no directional light is in the
+  scene (otherwise sunOnly=true would leave a directional-less scene
+  with no shadows at all).
+- Shader count: 12 (`mesh.vert/frag`, `mesh_skinned.vert`, `shadow.vert`,
+  `fullscreen.vert`, `bloom_downsample/upsample.frag`, `ssao.frag`,
+  `composite.frag`, `fxaa.frag`, `cull.comp`, `hzb_reduce.comp`).
 - Console on startup (5070 Ti, driver 591.86):
   - `[VulkanEngine] Logical device created (VRS supported) (RT supported)`
-  - `[DLSS] NGX initialised, DLSS Super Sampling available`
 - Expected validation noise:
   - 7× `Vertex attribute at location N not consumed` for the shadow
     pipeline (binds full InstanceData layout but shadow.vert only reads
@@ -530,6 +483,3 @@ it in `mesh.frag::main`'s motion vector computation.
     bug, harmless.
   - 2× `Layer ... API version 1.2 ... older than 1.3` for the Overwolf
     overlays — harmless.
-- The Halton jitter is sub-pixel; with DLSS toggled on you might see a
-  faint 1-pixel shimmer on contrasty edges. That's the only visible
-  effect of DLSS today.

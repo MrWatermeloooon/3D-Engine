@@ -42,7 +42,6 @@ set(SOURCES
     src/engine/gpu_cull.cpp
     src/engine/hzb.cpp
     src/engine/raytracing.cpp
-    src/engine/dlss.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
@@ -52,25 +51,9 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     GLM_FORCE_RADIANS
 )
 
-# ── DLSS (NVIDIA NGX) ─────────────────────────────────────────────
-# The SDK is expected locally in DLSS_SDK/ relative to this CMakeLists. We link the
-# release-flavour static import lib (nvsdk_ngx_d.lib) and copy the dev-signed
-# DLL next to the exe — the dev DLL ignores app-allowlisting, perfect for
-# in-development testing. Builds without DLSS_SDK/ on disk will fail at the
-# include step; that's intentional, integration is hard-required.
-set(DLSS_SDK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/DLSS_SDK)
-# Pick the lib variant matching the active CRT. Release uses /MD +
-# _ITERATOR_DEBUG_LEVEL=0; debug uses /MDd + IDL=2 — they must agree or the
-# linker rejects the mismatch (LNK2038).
-set(DLSS_LIB_RELEASE ${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib)
-set(DLSS_LIB_DEBUG   ${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib)
-set(DLSS_LIB         $<IF:$<CONFIG:Debug>,${DLSS_LIB_DEBUG},${DLSS_LIB_RELEASE}>)
-set(DLSS_DLL         ${DLSS_SDK_DIR}/lib/Windows_x86_64/dev/nvngx_dlss.dll)
-
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${Stb_INCLUDE_DIR}
-    ${DLSS_SDK_DIR}/include
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -81,15 +64,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     EnTT::EnTT
     imgui::imgui
     imguizmo::imguizmo
-    ${DLSS_LIB}
 )
-
-# Copy nvngx_dlss.dll next to the exe so NGX can find it at runtime.
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${DLSS_DLL}
-            $<TARGET_FILE_DIR:${PROJECT_NAME}>/nvngx_dlss.dll
-    COMMENT "Copying nvngx_dlss.dll next to exe")
 
 # ── Shader compilation (GLSL → SPIR-V) ───────────────────────
 find_program(GLSLC_EXECUTABLE glslc REQUIRED)

@@ -112,7 +112,7 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
     t.colorView = createImageView(device, t.colorImage.image, t.colorFormat,
                                   VK_IMAGE_ASPECT_COLOR_BIT, 1);
 
-    // Motion vectors: RG16F. Color attachment + sampleable by DLSS.
+    // Motion vectors: RG16F. Color attachment + sampleable by future TAA/upscalers.
     t.motionImage = createImage(physicalDevice, device, extent.width, extent.height, 1,
         t.motionFormat, VK_IMAGE_TILING_OPTIMAL,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -545,36 +545,6 @@ void destroyLdrTarget(VkDevice device, LdrTarget& t) {
     t = {};
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Upscale target (DLSS output → FXAA input when DLSS is on)
-// ──────────────────────────────────────────────────────────────────────────
-
-void createUpscaleTarget(UpscaleTarget& t, VkPhysicalDevice physicalDevice, VkDevice device,
-                         VkExtent2D extent)
-{
-    t.extent = extent;
-    // STORAGE for NGX write, SAMPLED for FXAA read, TRANSFER_DST to allow an
-    // initial layout transition + clear if we ever need to skip a DLSS frame.
-    t.image = createImage(physicalDevice, device, extent.width, extent.height, 1,
-        t.format, VK_IMAGE_TILING_OPTIMAL,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-            | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    t.view = createImageView(device, t.image.image, t.format, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-    t.sampler = makeLinearClampSampler(device);
-    t.wasInitialised = false;
-}
-
-void destroyUpscaleTarget(VkDevice device, UpscaleTarget& t) {
-    if (t.sampler) vkDestroySampler(device, t.sampler, nullptr);
-    if (t.view)    vkDestroyImageView(device, t.view, nullptr);
-    if (t.image.image) {
-        vkDestroyImage(device, t.image.image, nullptr);
-        vkFreeMemory(device, t.image.memory, nullptr);
-    }
-    t = {};
-}
-
 void updateCompositeUbo(CompositeData& c, uint32_t frameIndex, const PostFXSettings& s) {
     CompositeUboCpu u{};
     u.exposure          = s.exposure;
@@ -753,16 +723,14 @@ static VkPipeline makeFullscreenPipeline(VkDevice device, VkRenderPass renderPas
 void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloom,
                            SSAOTarget& ssao, CompositeData& composite, LdrTarget& ldr,
                            OffscreenTarget& offscreen, VkRenderPass swapchainPass,
-                           uint32_t framesInFlight,
-                           UpscaleTarget* upscale)
+                           uint32_t framesInFlight)
 {
     uint32_t bloomSets    = BLOOM_MIP_COUNT * 2;
-    uint32_t fxaaSets     = upscale ? 2u : 1u;
-    uint32_t totalSets    = bloomSets + framesInFlight /*ssao*/ + framesInFlight /*composite*/ + fxaaSets /*fxaa*/;
+    uint32_t totalSets    = bloomSets + framesInFlight /*ssao*/ + framesInFlight /*composite*/ + 1 /*fxaa*/;
 
     VkDescriptorPoolSize sizes[] = {
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-          bloomSets + framesInFlight * 2 /*ssao*/ + framesInFlight * 3 /*comp*/ + fxaaSets /*fxaa*/ },
+          bloomSets + framesInFlight * 2 /*ssao*/ + framesInFlight * 3 /*comp*/ + 1 /*fxaa*/ },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         framesInFlight + framesInFlight },
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -884,7 +852,7 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
         return set;
     };
 
-    // Bloom downsample sets: mip 0 reads HDR, mip i (>0) reads mip i-1
+    // Bloom downsample sets: mip 0 reads HDR offscreen, mip i (>0) reads mip i-1
     for (uint32_t i = 0; i < BLOOM_MIP_COUNT; ++i) {
         bloom.downsampleSets[i] = allocSet(p.bloomSetLayout);
         VkDescriptorImageInfo img{};
@@ -944,7 +912,7 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
         vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
     }
 
-    // FXAA descriptor set (reads from LDR target)
+    // FXAA descriptor set (reads from the post-composite LDR target).
     {
         ldr.descriptorSet = allocSet(p.fxaaSetLayout);
         VkDescriptorImageInfo info{};
@@ -954,22 +922,6 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
         VkWriteDescriptorSet w{};
         w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w.dstSet = ldr.descriptorSet; w.dstBinding = 0;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w.descriptorCount = 1; w.pImageInfo = &info;
-        vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
-    }
-
-    // Optional FXAA descriptor for the DLSS upscale target. Used by the
-    // renderer when a DLSS feature is active.
-    if (upscale) {
-        upscale->descriptorSet = allocSet(p.fxaaSetLayout);
-        VkDescriptorImageInfo info{};
-        info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        info.imageView   = upscale->view;
-        info.sampler     = upscale->sampler;
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = upscale->descriptorSet; w.dstBinding = 0;
         w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w.descriptorCount = 1; w.pImageInfo = &info;
         vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);

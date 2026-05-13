@@ -51,9 +51,22 @@ void main() {
     // Exposure
     hdr *= pow(2.0, ubo.exposure);
 
-    // SSAO multiplies result (mostly affects ambient/dark areas)
+    // SSAO multiplies result (mostly affects ambient/dark areas).
+    // The SSAO shader rotates its kernel per-pixel using a 4×4 random-noise
+    // texture, which would otherwise produce a visible stippled / dithered
+    // pattern in soft AO regions. We blur out that noise with a 4×4 box
+    // filter exactly matching the noise tile size — every neighbourhood
+    // averages one full rotation cycle, so the result is denoise-free at
+    // negligible cost (16 bilinear texture taps).
     if (ubo.enableSSAO == 1) {
-        float ao = texture(ssaoTex, vUV).r;
+        vec2 texel = 1.0 / vec2(textureSize(ssaoTex, 0));
+        float ao = 0.0;
+        for (int y = -2; y <= 1; ++y) {
+            for (int x = -2; x <= 1; ++x) {
+                ao += texture(ssaoTex, vUV + vec2(x, y) * texel).r;
+            }
+        }
+        ao /= 16.0;
         ao = mix(1.0, ao, ubo.ssaoStrength);
         hdr *= ao;
     }

@@ -22,7 +22,6 @@
 #include "gpu_cull.h"
 #include "hzb.h"
 #include "raytracing.h"
-#include "dlss.h"
 
 class Engine {
 public:
@@ -38,17 +37,6 @@ public:
 private:
     void recreateSwapchain();
     void processInput(double deltaTime);
-
-    // Pick the offscreen render extent — m_swapchain.extent when DLSS is off,
-    // the NGX-reported optimal input size when on. Stores into m_renderExtent.
-    // If DLSS is on but NGX fails, falls back to native and forces dlssEnabled
-    // off so callers don't try to create a feature.
-    void computeRenderExtent();
-
-    // After the offscreen/upscale targets exist and m_renderExtent matches the
-    // user's wanted DLSS state, (re)build the NGX feature. Submits a one-shot
-    // command buffer (NGX records init work into it). Updates m_dlssActive*.
-    void rebuildDlssFeatureIfNeeded();
 
     Window*          m_window = nullptr;
     VulkanContext    m_vk{};
@@ -77,33 +65,14 @@ private:
     RtScene            m_rtScene;
     RtSettings         m_rtSettings{};
 
-    // DLSS (Phase 4). `m_haltonIndex` cycles per frame to drive sub-pixel
-    // jitter; `m_currViewProj` / `m_dlssPrevViewProj` feed mesh.vert's motion
-    // vector calculation (separate from m_prevViewProj which is used by GPU
-    // cull's HZB projection — same value, kept distinct for clarity).
-    DlssSettings       m_dlssSettings{};
-    uint32_t           m_haltonIndex = 1;
-    glm::mat4          m_dlssPrevViewProj{1.0f};
-
-    // Effective offscreen render resolution. Equal to m_swapchain.extent when
-    // DLSS is off; the optimal-input size reported by NGX when DLSS is on.
-    VkExtent2D         m_renderExtent{0, 0};
-
-    // Tracks the (enabled, quality) snapshot the current DLSS feature was
-    // created for. Differs from m_dlssSettings → trigger a recreate at the
-    // top of the next frame.
-    bool               m_dlssActiveEnabled = false;
-    DlssQuality        m_dlssActiveQuality = DlssQuality::Off;
-    bool               m_dlssResetHistory  = true;
-
-    // Full-res target that DLSS writes its upscaled output into. Resides at
-    // m_swapchain.extent. FXAA samples from here when the active DLSS
-    // feature is alive.
-    UpscaleTarget      m_upscale;
+    // Motion-vector + jitter scaffolding kept for future TAA / upscaling
+    // integration. Currently inert (no upscaling, no jitter applied to
+    // the projection). The shader still computes and writes motion vectors
+    // into a second offscreen attachment, which costs negligible bandwidth.
+    glm::mat4          m_prevViewProjMotion{1.0f}; // un-jittered, for motion vectors
 
 public:
     RtSettings&   rtSettings()   { return m_rtSettings; }
-    DlssSettings& dlssSettings() { return m_dlssSettings; }
 
 private:
 
