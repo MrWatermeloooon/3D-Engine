@@ -1,8 +1,11 @@
 #include "buffer.h"
+#include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
 #include <stdexcept>
 
+// findMemoryType is kept for the few sites (manual descriptor-set allocators)
+// that still query memory-type indices. VMA does its own selection internally.
 uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter,
                         VkMemoryPropertyFlags properties) {
     VkPhysicalDeviceMemoryProperties memProps;
@@ -17,41 +20,41 @@ uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter,
     throw std::runtime_error("Failed to find suitable memory type");
 }
 
-AllocatedBuffer createBuffer(VkPhysicalDevice physicalDevice, VkDevice device,
+AllocatedBuffer createBuffer(VkPhysicalDevice /*physicalDevice*/, VkDevice /*device*/,
                              VkDeviceSize size, VkBufferUsageFlags usage,
                              VkMemoryPropertyFlags properties) {
     AllocatedBuffer result;
 
     VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = size;
-    bufferInfo.usage = usage;
+    bufferInfo.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size        = size;
+    bufferInfo.usage       = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    VK_CHECK(vkCreateBuffer(device, &bufferInfo, nullptr, &result.buffer));
+    VmaAllocationCreateInfo aci{};
 
-    VkMemoryRequirements memReqs;
-    vkGetBufferMemoryRequirements(device, result.buffer, &memReqs);
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, properties);
-
-    // Buffers that callers will read via device address (ray-tracing inputs,
-    // acceleration structure storage, scratch) must opt into the matching
-    // memory allocate flag. Detect the usage flag here so callers don't need
-    // to remember the dual configuration.
-    VkMemoryAllocateFlagsInfo flagsInfo{};
-    flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-    if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
-        allocInfo.pNext = &flagsInfo;
+    const bool wantsHostVisible = (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    if (wantsHostVisible) {
+        // Persistent CPU-write target: instance buffers, candidate stream,
+        // UBOs, staging. AUTO_PREFER_HOST lands these in BAR/host memory;
+        // SEQUENTIAL_WRITE_BIT lets VMA pick a write-combined memory type
+        // (faster on PCIe upload) when one is available. MAPPED_BIT keeps the
+        // pointer alive across frames so we never touch vkMapMemory.
+        aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                  | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    } else {
+        // Pure GPU-side buffer: BLAS/TLAS storage, scratch, device-local
+        // staging targets, indirect drawer counters. No host map.
+        aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     }
 
-    VK_CHECK(vkAllocateMemory(device, &allocInfo, nullptr, &result.memory));
-    vkBindBufferMemory(device, result.buffer, result.memory, 0);
-
+    VmaAllocationInfo info{};
+    VK_CHECK(vmaCreateBuffer(gVmaAllocator, &bufferInfo, &aci,
+                             &result.buffer, &result.allocation, &info));
+    // VMA places the persistent map (when requested) at allocationInfo.pMappedData.
+    // For non-host-visible allocations this is null.
+    result.mapped = info.pMappedData;
     return result;
 }
 
@@ -66,64 +69,67 @@ void copyBuffer(VkDevice device, VkCommandPool commandPool, VkQueue queue,
     endSingleTimeCommands(device, commandPool, queue, cmd);
 }
 
-void destroyBuffer(VkDevice device, AllocatedBuffer& buf) {
+void destroyBuffer(VkDevice /*device*/, AllocatedBuffer& buf) {
     if (buf.buffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, buf.buffer, nullptr);
-        vkFreeMemory(device, buf.memory, nullptr);
-        buf.buffer = VK_NULL_HANDLE;
-        buf.memory = VK_NULL_HANDLE;
+        vmaDestroyBuffer(gVmaAllocator, buf.buffer, buf.allocation);
+        buf.buffer     = VK_NULL_HANDLE;
+        buf.allocation = VK_NULL_HANDLE;
+        buf.mapped     = nullptr;
     }
 }
 
-AllocatedImage createImage(VkPhysicalDevice physicalDevice, VkDevice device,
+AllocatedImage createImage(VkPhysicalDevice /*physicalDevice*/, VkDevice /*device*/,
                            uint32_t width, uint32_t height, uint32_t mipLevels,
                            VkFormat format, VkImageTiling tiling,
                            VkImageUsageFlags usage, VkMemoryPropertyFlags properties) {
     AllocatedImage result;
 
     VkImageCreateInfo imageInfo{};
-    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.extent.width = width;
+    imageInfo.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType     = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width  = width;
     imageInfo.extent.height = height;
-    imageInfo.extent.depth = 1;
-    imageInfo.mipLevels = mipLevels;
-    imageInfo.arrayLayers = 1;
-    imageInfo.format = format;
-    imageInfo.tiling = tiling;
+    imageInfo.extent.depth  = 1;
+    imageInfo.mipLevels     = mipLevels;
+    imageInfo.arrayLayers   = 1;
+    imageInfo.format        = format;
+    imageInfo.tiling        = tiling;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    imageInfo.usage = usage;
-    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.usage         = usage;
+    imageInfo.samples       = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
 
-    VK_CHECK(vkCreateImage(device, &imageInfo, nullptr, &result.image));
+    VmaAllocationCreateInfo aci{};
+    // All images in this engine are GPU-side (color/depth attachments, shadow
+    // maps, HZB, SSAO noise/output). Host-visible images don't appear.
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    (void)properties; // legacy hint preserved in signature; VMA ignores
 
-    VkMemoryRequirements memReqs;
-    vkGetImageMemoryRequirements(device, result.image, &memReqs);
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits, properties);
-
-    VK_CHECK(vkAllocateMemory(device, &allocInfo, nullptr, &result.memory));
-    vkBindImageMemory(device, result.image, result.memory, 0);
-
+    VK_CHECK(vmaCreateImage(gVmaAllocator, &imageInfo, &aci,
+                            &result.image, &result.allocation, nullptr));
     return result;
+}
+
+void destroyImage(VkDevice /*device*/, AllocatedImage& img) {
+    if (img.image != VK_NULL_HANDLE) {
+        vmaDestroyImage(gVmaAllocator, img.image, img.allocation);
+        img.image      = VK_NULL_HANDLE;
+        img.allocation = VK_NULL_HANDLE;
+    }
 }
 
 VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,
                             VkImageAspectFlags aspectFlags, uint32_t mipLevels) {
     VkImageViewCreateInfo viewInfo{};
-    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    viewInfo.image = image;
+    viewInfo.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image    = image;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = format;
-    viewInfo.subresourceRange.aspectMask = aspectFlags;
-    viewInfo.subresourceRange.baseMipLevel = 0;
-    viewInfo.subresourceRange.levelCount = mipLevels;
+    viewInfo.format   = format;
+    viewInfo.subresourceRange.aspectMask     = aspectFlags;
+    viewInfo.subresourceRange.baseMipLevel   = 0;
+    viewInfo.subresourceRange.levelCount     = mipLevels;
     viewInfo.subresourceRange.baseArrayLayer = 0;
-    viewInfo.subresourceRange.layerCount = 1;
+    viewInfo.subresourceRange.layerCount     = 1;
 
     VkImageView view;
     VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &view));
@@ -132,9 +138,9 @@ VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,
 
 VkCommandBuffer beginSingleTimeCommands(VkDevice device, VkCommandPool commandPool) {
     VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = commandPool;
+    allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool        = commandPool;
     allocInfo.commandBufferCount = 1;
 
     VkCommandBuffer cmd;
@@ -156,17 +162,17 @@ void endSingleTimeCommands(VkDevice device, VkCommandPool commandPool,
     // Avoids vkQueueWaitIdle which stalls the entire queue (problematic during
     // hot-reload / runtime uploads while frame rendering is in flight).
     VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
+    submitInfo.pCommandBuffers    = &cmd;
 
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence fence;
-    vkCreateFence(device, &fenceInfo, nullptr, &fence);
+    VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &fence));
 
-    vkQueueSubmit(queue, 1, &submitInfo, fence);
-    vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+    VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, fence));
+    VK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
     vkDestroyFence(device, fence, nullptr);
 
     vkFreeCommandBuffers(device, commandPool, 1, &cmd);
@@ -178,17 +184,17 @@ void transitionImageLayout(VkDevice device, VkCommandPool commandPool, VkQueue q
     auto cmd = beginSingleTimeCommands(device, commandPool);
 
     VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
+    barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout           = oldLayout;
+    barrier.newLayout           = newLayout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = mipLevels;
+    barrier.image               = image;
+    barrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel   = 0;
+    barrier.subresourceRange.levelCount     = mipLevels;
     barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
+    barrier.subresourceRange.layerCount     = 1;
 
     VkPipelineStageFlags srcStage;
     VkPipelineStageFlags dstStage;

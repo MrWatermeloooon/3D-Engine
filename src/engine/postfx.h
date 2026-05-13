@@ -6,9 +6,10 @@
 #include <array>
 
 #include "buffer.h"
+#include "config.h"
 
-constexpr uint32_t BLOOM_MIP_COUNT = 4;
-constexpr uint32_t SSAO_KERNEL_SIZE = 16;
+using engine_config::BLOOM_MIP_COUNT;
+using engine_config::SSAO_KERNEL_SIZE;
 
 // ── HDR offscreen target (main pass output) ─────────────────────────────────
 
@@ -21,7 +22,8 @@ struct OffscreenTarget {
     VkImageView    motionView   = VK_NULL_HANDLE;
     AllocatedImage depthImage;
     VkImageView    depthView    = VK_NULL_HANDLE;    // depth aspect (attachment + sampling)
-    VkRenderPass   renderPass   = VK_NULL_HANDLE;
+    VkRenderPass   renderPass     = VK_NULL_HANDLE;  // pass-A: CLEAR + initial UNDEFINED
+    VkRenderPass   renderPassLate = VK_NULL_HANDLE;  // pass-B: LOAD + initial READ_ONLY (Phase 2.2)
     VkFramebuffer  framebuffer  = VK_NULL_HANDLE;
     VkSampler      sampler      = VK_NULL_HANDLE;    // for sampling color in post-fx
     VkSampler      depthSampler = VK_NULL_HANDLE;    // for sampling depth in SSAO
@@ -103,13 +105,16 @@ struct PostFXSettings {
 
     // Bloom
     bool  bloomEnabled      = true;
-    float bloomStrength     = 0.05f;
-    float bloomThreshold    = 1.0f;
+    float bloomStrength     = 0.04f;
+    // Threshold raised above 1.0 so an idle scene (lit only by IBL ≤ 1.0
+    // SDR-range) doesn't bloom every chrome highlight. Crank back toward 1.0
+    // for a hazier, more cinematic look when you have an explicit sun.
+    float bloomThreshold    = 1.5f;
     float bloomFilterRadius = 1.0f;
 
     // SSAO
     bool  ssaoEnabled       = true;
-    float ssaoStrength      = 0.85f;
+    float ssaoStrength      = 0.5f;
     float ssaoRadius        = 0.5f;
     float ssaoBias          = 0.025f;
     float ssaoIntensity     = 1.5f;
@@ -117,6 +122,18 @@ struct PostFXSettings {
     // Vignette
     float vignetteIntensity = 0.6f;
     float vignetteFalloff   = 0.15f;
+
+    // Depth of field (CoC-based, computed inside the composite pass — see
+    // composite.frag). Disabled by default so the screenshot look matches
+    // the pre-DoF builds; enable to introduce focus.
+    bool  dofEnabled       = false;
+    float dofFocusDistance = 5.0f;   // metres of view-space depth in focus
+    float dofFocusRange    = 1.5f;   // depth half-range that stays sharp
+    float dofBokehRadius   = 4.0f;   // max CoC radius in pixels
+    // Camera near/far for the depth linearisation in the shader. Set by the
+    // engine to match the current camera each frame.
+    float nearClip         = 0.1f;
+    float farClip          = 200.0f;
 
     // FXAA
     bool  fxaaEnabled = true;

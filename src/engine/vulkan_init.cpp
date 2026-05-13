@@ -6,6 +6,31 @@
 #include <string>
 #include <cstring>
 
+// Global VMA allocator. Created in createVmaAllocator() after device creation,
+// destroyed in destroyVmaAllocator() before the device. All AllocatedBuffer /
+// AllocatedImage instances live inside this allocator's pages.
+VmaAllocator gVmaAllocator = VK_NULL_HANDLE;
+
+void createVmaAllocator(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device) {
+    VmaAllocatorCreateInfo info{};
+    info.instance         = instance;
+    info.physicalDevice   = physicalDevice;
+    info.device           = device;
+    info.vulkanApiVersion = VK_API_VERSION_1_3;
+    // Enable BUFFER_DEVICE_ADDRESS allocation flag pass-through. Without this
+    // VMA refuses to allocate buffers requested with
+    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT (the RT-related buffers).
+    info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    VK_CHECK(vmaCreateAllocator(&info, &gVmaAllocator));
+}
+
+void destroyVmaAllocator() {
+    if (gVmaAllocator != VK_NULL_HANDLE) {
+        vmaDestroyAllocator(gVmaAllocator);
+        gVmaAllocator = VK_NULL_HANDLE;
+    }
+}
+
 // ── Debug messenger callback ────────────────────────────────────────────────
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
@@ -200,17 +225,20 @@ VkPhysicalDevice pickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface) {
 
 // ── Logical device ──────────────────────────────────────────────────────────
 
-bool                                  VRS_SUPPORTED = false;
-PFN_vkCmdSetFragmentShadingRateKHR    VRS_SetRate   = nullptr;
+DeviceCapabilities gDeviceCaps{};
 
-bool                                                 RT_SUPPORTED              = false;
-PFN_vkCreateAccelerationStructureKHR                 RT_CreateAS               = nullptr;
-PFN_vkDestroyAccelerationStructureKHR                RT_DestroyAS              = nullptr;
-PFN_vkGetAccelerationStructureBuildSizesKHR          RT_GetASBuildSizes        = nullptr;
-PFN_vkGetAccelerationStructureDeviceAddressKHR       RT_GetASDeviceAddress     = nullptr;
-PFN_vkCmdBuildAccelerationStructuresKHR              RT_CmdBuildAS             = nullptr;
-PFN_vkCmdWriteAccelerationStructuresPropertiesKHR    RT_CmdWriteASProps        = nullptr;
-PFN_vkGetBufferDeviceAddressKHR                      RT_GetBufferDeviceAddress = nullptr;
+void resetDeviceCapabilities() { gDeviceCaps = DeviceCapabilities{}; }
+
+// Small helper to chain feature structs without manually rewiring pointers
+// every time a new optional feature is added. Sets head.pNext = next and
+// returns next so calls can be daisy-chained:
+//   chain(chain(&features2, &vk12), &rqFeat);
+template <typename Head, typename Next>
+static Next* chainPNext(Head* head, Next* next) {
+    next->pNext = head->pNext;
+    head->pNext = next;
+    return next;
+}
 
 // Returns true if the device exposes VK_KHR_fragment_shading_rate AND the
 // pipelineFragmentShadingRate feature. Attachment-based VRS (texel-rate image)
@@ -309,6 +337,10 @@ static bool deviceSupportsVRS(VkPhysicalDevice physicalDevice) {
 
 VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyIndices& indices,
                              const std::vector<const char*>& extraExtensions) {
+    // Wipe any state left over from a previous engine instance — without this,
+    // a second engine's probe results overwrite the first's on top.
+    resetDeviceCapabilities();
+
     std::vector<VkDeviceQueueCreateInfo> queueInfos;
     std::set<uint32_t> uniqueFamilies = {
         indices.graphicsFamily.value(),
@@ -366,15 +398,17 @@ VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyI
     features2.features.samplerAnisotropy = VK_TRUE;
     features2.features.shaderInt64       = VK_TRUE; // mesh.frag uint64_t
 
-    // Chain optional features into vk12.pNext. The chain looks like:
+    // Chain optional features. The chain looks like:
     //   features2 → vk12 → [vrsFeat] → [asFeat → rqFeat]
-    void** tail = &vk12.pNext;
-    if (vrsSupported) { *tail = &vrsFeat; tail = &vrsFeat.pNext; }
+    // chainPNext() preserves whatever the head already pointed at, so adding
+    // a new feature in the middle later just needs another line — no manual
+    // tail-pointer bookkeeping.
+    if (vrsSupported) chainPNext(&vk12, &vrsFeat);
     if (rtSupported) {
         // Enable bufferDeviceAddress on the existing vk12 struct (core 1.2).
         vk12.bufferDeviceAddress = VK_TRUE;
-        *tail = &asFeat;  tail = &asFeat.pNext;
-        *tail = &rqFeat;  tail = &rqFeat.pNext;
+        chainPNext(&vk12, &asFeat);
+        chainPNext(&vk12, &rqFeat);
     }
 
     // Build the per-device extension list, copying base + optionally VRS + RT.

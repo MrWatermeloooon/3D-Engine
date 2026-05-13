@@ -16,6 +16,14 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Mesh LOD groups with compute-side LOD selection and per-LOD indirect draw slots.
 - Bindless texture array with descriptor indexing and update-after-bind support.
 - Hardware ray tracing path with BLAS/TLAS builds, Vulkan ray queries, ray-traced shadows, reflections, and one-bounce GI.
+- Two-pass occlusion path: previous-frame HZB cull, first main pass, fresh HZB reduction, late cull, and second main pass with load ops.
+- Spatial BVH CPU pre-cull with a linear-scan fallback for small entity counts.
+- glTF 2.0 skeletal importer with skins, joints, inverse bind matrices, skinned vertex attributes, indices, and animation channels.
+- Animator UI with clip selection, play/pause/stop, scrubbing, speed control, loop toggle, and clip/joint readouts.
+- Normal mapping and height-map parallax for static meshes.
+- Skybox and split-sum IBL with environment, irradiance, prefiltered specular, and BRDF LUT resources.
+- Frame timing profiler with GPU timestamp scopes and RAII CPU scopes.
+- VMA-backed buffer and image allocation through Vulkan Memory Allocator.
 - Motion-vector render target and scene jitter scaffolding for future TAA or upscaling work.
 - Job system with fire-and-forget tasks, blocking `parallel_for`, and frame-work barriers.
 - Variable-rate shading support through `VK_KHR_fragment_shading_rate`, with per-LOD rates and UI override when available.
@@ -25,7 +33,7 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Bloom downsample/upsample pass.
 - SSAO pass with configurable kernel and debug views.
 - Composite post-processing with exposure, gamma, saturation, contrast, vignette, tone mapping, and FXAA controls.
-- Skeletal animation infrastructure with skeletons, animation channels, skinned vertex data, bone palette uploads, and a test bone-chain demo.
+- Skeletal animation infrastructure with skeletons, animation channels, skinned vertex data, bone palette uploads, and glTF import support.
 - ImGui debug UI and ImGuizmo integration.
 - GLSL shader compilation to SPIR-V through CMake.
 
@@ -48,6 +56,12 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Motion-vector rendering writes a second RG16F attachment, with matching blend state to avoid validation warnings.
 - SSAO is filtered with a 4x4 box average in the composite pass to remove visible stippled noise.
 - RT shadows now handle non-directional-only scenes correctly by allowing point and spot lights to cast shadows when no directional light exists.
+- Transform components cache world and normal matrices with value-based dirty detection.
+- GPU allocations migrated to VMA, including buffers, images, shadow resources, HZB, bloom, RT scratch buffers, skeletal buffers, and texture resources.
+- Candidate building now uses a single resolved-entity walk so BVH entries and GPU cull candidates avoid repeated registry lookups.
+- Mesh BLAS address data is cached at upload time, reducing per-frame TLAS gather overhead.
+- GPU timing covers TLAS build, culling, shadow, main passes, HZB, SSAO, bloom, composite, FXAA, and UI.
+- RT/IBL quality tuning reduced bloom over bright IBL highlights, softened SSAO defaults, restored GI attenuation, raised GI sample limits, and added subgroup quad averaging for GI.
 
 ## Tech Stack
 
@@ -59,10 +73,12 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - GLFW
 - GLM
 - tinyobjloader
+- cgltf
 - stb
 - EnTT
 - ImGui
 - ImGuizmo
+- Vulkan Memory Allocator
 
 ## Project Structure
 
@@ -108,6 +124,8 @@ cmake --build --preset release
 
 Compiled shaders are generated into the build output and copied beside the executable after build.
 
+On Windows, `build-release.bat` can configure and build the release preset after sourcing the Visual Studio developer environment.
+
 ## Run
 
 After building, run the generated `VulkanEngine` executable from the build output directory.
@@ -118,20 +136,25 @@ The repository intentionally ignores local build output, Visual Studio metadata,
 
 If a Windows build fails with `LNK1168`, another program may be holding the executable open. Close capture/overlay tools such as Medal, OBS, or Overwolf, then rebuild.
 
+## Known Issues / In Progress
+
+- RT-off rendering still has some unwanted softness or grain. This is not counted as fixed yet; likely suspects are FXAA edge softening or residual SSAO noise, but it still needs a before/after comparison pass.
+- RT GI can still show visible noise even with subgroup quad averaging. The intended long-term fix is temporal accumulation/TAA.
+
 ## Future Additions
 
 ### Core Rendering
 
-- glTF skeletal animation importer: load skins, joints, inverse-bind matrices, vertex weights, and animation channels from glTF files.
-- Skeletal animation UI polish: expose animator time, speed, clip selection, and playback controls in the properties panel.
-- Normal mapping: tangent-space normals with optional parallax.
-- Skybox + IBL: HDR environment map, irradiance, and specular probe.
+- Skinned tangent support so normal mapping and parallax can be enabled on animated meshes.
+- Broader glTF material support, including normal, metallic-roughness, emissive, and occlusion texture import.
+- Animation blending and layered animation support.
 
 ### RTX / Ray Tracing
 
 - DLSS or Streamline upscaling: revisit AI upscaling later using the existing motion-vector scaffold, preferably without a hard NGX SDK dependency.
 - Previous per-instance transforms for true object motion vectors instead of camera-only motion.
 - Denoising and temporal accumulation for cleaner ray-traced GI and glossy reflections.
+- Higher-quality RT reflection filtering for glossy materials.
 
 ### Visual Quality
 

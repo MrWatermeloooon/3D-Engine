@@ -25,3 +25,10 @@ PipelineData createSkinnedPipeline(VkDevice device, VkRenderPass renderPass, VkE
                                    VkDescriptorSetLayout materialSetLayout,
                                    VkDescriptorSetLayout boneSetLayout,
                                    const std::string& vertPath, const std::string& fragPath);
+
+// Skinned shadow pipeline: depth-only, takes (lightViewProj, model) as push
+// constants and the same bone palette set as the main skinned pipeline.
+PipelineData createSkinnedShadowPipeline(VkDevice device, VkRenderPass shadowRenderPass,
+                                         uint32_t shadowMapSize,
+                                         VkDescriptorSetLayout boneSetLayout,
+                                         const std::string& vertPath);

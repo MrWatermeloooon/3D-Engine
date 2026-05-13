@@ -1,5 +1,6 @@
 #include "hzb.h"
 #include "pipeline.h"
+#include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
 #include <algorithm>
@@ -45,17 +46,13 @@ void createHzb(HzbData& hzb,
                       | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(device, &ici, nullptr, &hzb.image.image));
-
-    VkMemoryRequirements memReq{};
-    vkGetImageMemoryRequirements(device, hzb.image.image, &memReq);
-    VkMemoryAllocateInfo mai{};
-    mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize  = memReq.size;
-    mai.memoryTypeIndex = findMemoryType(physicalDevice, memReq.memoryTypeBits,
-                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &hzb.image.memory));
-    VK_CHECK(vkBindImageMemory(device, hzb.image.image, hzb.image.memory, 0));
+    {
+        VmaAllocationCreateInfo aci{};
+        aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        VK_CHECK(vmaCreateImage(gVmaAllocator, &ici, &aci,
+                                &hzb.image.image, &hzb.image.allocation, nullptr));
+        (void)physicalDevice;
+    }
 
     // ── Views ───────────────────────────────────────────────────────────────
     // Full chain view (for sampling in cull).
@@ -265,8 +262,7 @@ void destroyHzb(VkDevice device, HzbData& hzb) {
     for (auto v : hzb.mipViews)    if (v) vkDestroyImageView(device, v, nullptr);
     hzb.mipViews.clear();
     if (hzb.fullView)              vkDestroyImageView(device, hzb.fullView, nullptr);
-    if (hzb.image.image)           vkDestroyImage(device, hzb.image.image, nullptr);
-    if (hzb.image.memory)          vkFreeMemory(device, hzb.image.memory, nullptr);
+    destroyImage(device, hzb.image);
     hzb = {};
 }
 

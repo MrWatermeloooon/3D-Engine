@@ -6,7 +6,9 @@
     "glm",
     "stb",
     "tinyobjloader",
+    "cgltf",
     "entt",
+    "vulkan-memory-allocator",
     {
       "name": "imgui",
       "features": ["glfw-binding", "vulkan-binding", "docking-experimental"]

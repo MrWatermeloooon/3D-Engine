@@ -9,8 +9,9 @@
 #include <array>
 
 #include "buffer.h"
+#include "config.h"
 
-constexpr uint32_t MAX_BONES = 64;
+using engine_config::MAX_BONES;
 
 // ── Skeleton ────────────────────────────────────────────────────────────────
 

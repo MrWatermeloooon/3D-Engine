@@ -88,5 +88,14 @@ void writeSceneTlas(DescriptorData& data, VkDevice device, uint32_t frame,
 void writeSceneRtMaterials(DescriptorData& data, VkDevice device, uint32_t frame,
                            VkBuffer buffer, VkDeviceSize bufferSize);
 
+// IBL bindings (6 = irradiance cube, 7 = prefilter cube, 8 = BRDF LUT). Each
+// is a sampler-image descriptor — the IBL bake hands in views + samplers.
+// Call once per frame-in-flight after the IBL bake completes, or after
+// rebuilding the IBL probes from a new HDR.
+void writeSceneIbl(DescriptorData& data, VkDevice device, uint32_t frame,
+                   VkImageView irradianceView, VkImageView prefilterView,
+                   VkImageView brdfLutView,
+                   VkSampler cubeSampler, VkSampler lutSampler);
+
 void updateUniformBuffer(DescriptorData& data, uint32_t currentFrame,
                          const UniformBufferObject& ubo);

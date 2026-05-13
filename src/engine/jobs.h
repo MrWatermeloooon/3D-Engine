@@ -32,7 +32,35 @@ public:
     void wait_all();
 
     // Split [0, count) into chunks and run `fn(i)` for each `i` in parallel.
-    void parallel_for(size_t count, std::function<void(size_t)> fn);
+    // Templated so the per-iteration call dispatches DIRECTLY rather than
+    // through std::function — in Debug builds (/Od /RTC1) the type-erased
+    // version is ~10x slower per call, which dominates when the per-entity
+    // body is small (~1 µs). Only the chunk-level enqueue (worker_count
+    // dispatches per parallel_for) still goes through std::function, and
+    // that overhead is amortized over thousands of indices.
+    template <typename F>
+    void parallel_for(size_t count, F fn) {
+        if (count == 0) return;
+        if (m_workers.empty()) {
+            for (size_t i = 0; i < count; ++i) fn(i);
+            return;
+        }
+        size_t chunks = std::min<size_t>(count, m_workers.size());
+        size_t per    = (count + chunks - 1) / chunks;
+        for (size_t c = 0; c < chunks; ++c) {
+            size_t begin = c * per;
+            size_t end   = std::min(begin + per, count);
+            if (begin >= end) continue;
+            // Capture fn BY VALUE so each chunk owns a copy; the source may go
+            // out of scope before the worker picks the task up. Inside the
+            // chunk, fn(i) is a direct call into the lambda's operator() —
+            // no virtual dispatch, fully inlinable in Release.
+            enqueue([begin, end, fn]() mutable {
+                for (size_t i = begin; i < end; ++i) fn(i);
+            });
+        }
+        wait_all();
+    }
 
     uint32_t worker_count() const { return static_cast<uint32_t>(m_workers.size()); }
 

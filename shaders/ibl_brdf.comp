@@ -1,0 +1,84 @@
+#version 450
+
+// Pre-integrated split-sum BRDF LUT. X axis = NdotV (0..1), Y axis = roughness
+// (0..1). Output is R = scale, G = bias such that the runtime IBL evaluation
+// reads
+//     F * scale + bias
+// for any Fresnel reflectance F (RGB). One shot, 512×512 RG16F.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform Push {
+    uint size;        // square LUT size
+    uint sampleCount; // GGX integration samples per LUT texel
+} pc;
+
+layout(set = 0, binding = 0, rg16f) writeonly uniform image2D brdfLUT;
+
+const float PI = 3.14159265359;
+
+float radicalInverseVdC(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+vec2 hammersley(uint i, uint N) {
+    return vec2(float(i) / float(N), radicalInverseVdC(i));
+}
+
+vec3 importanceSampleGGX(vec2 Xi, float roughness, vec3 N) {
+    float a = roughness * roughness;
+    float phi      = 2.0 * PI * Xi.x;
+    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a*a - 1.0) * Xi.y));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    vec3 H = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T  = normalize(cross(up, N));
+    vec3 B  = cross(N, T);
+    return normalize(T * H.x + B * H.y + N * H.z);
+}
+
+// Smith geometry term, k tuned for IBL (different from direct lighting).
+float G_SchlickGGX_IBL(float NoX, float roughness) {
+    float a = roughness;
+    float k = (a * a) * 0.5;
+    return NoX / (NoX * (1.0 - k) + k);
+}
+float G_Smith_IBL(float NoV, float NoL, float roughness) {
+    return G_SchlickGGX_IBL(NoV, roughness) * G_SchlickGGX_IBL(NoL, roughness);
+}
+
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if (xy.x >= pc.size || xy.y >= pc.size) return;
+
+    float NoV       = (float(xy.x) + 0.5) / float(pc.size);
+    float roughness = (float(xy.y) + 0.5) / float(pc.size);
+
+    vec3 V = vec3(sqrt(1.0 - NoV * NoV), 0.0, NoV);
+    vec3 N = vec3(0.0, 0.0, 1.0);
+
+    float A = 0.0, B = 0.0;
+    for (uint i = 0u; i < pc.sampleCount; ++i) {
+        vec2 Xi = hammersley(i, pc.sampleCount);
+        vec3 H  = importanceSampleGGX(Xi, roughness, N);
+        vec3 L  = normalize(2.0 * dot(V, H) * H - V);
+
+        float NoL = max(L.z, 0.0);
+        if (NoL > 0.0) {
+            float NoH = max(H.z, 0.0);
+            float VoH = max(dot(V, H), 0.0);
+            float G   = G_Smith_IBL(NoV, NoL, roughness);
+            float Gvis = G * VoH / max(NoH * NoV, 0.0001);
+            float Fc   = pow(1.0 - VoH, 5.0);
+            A += (1.0 - Fc) * Gvis;
+            B += Fc * Gvis;
+        }
+    }
+    A /= float(pc.sampleCount);
+    B /= float(pc.sampleCount);
+    imageStore(brdfLUT, ivec2(xy), vec4(A, B, 0.0, 0.0));
+}

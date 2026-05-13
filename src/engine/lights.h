@@ -7,8 +7,9 @@
 #include <entt/entt.hpp>
 
 #include "buffer.h"
+#include "config.h"
 
-constexpr uint32_t MAX_LIGHTS = 32;
+using engine_config::MAX_LIGHTS;
 
 // GPU-side representation of a light. 64 bytes, packed for std140.
 struct LightData {

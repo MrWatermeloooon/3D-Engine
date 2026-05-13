@@ -6,6 +6,9 @@
 #include "postfx.h"
 #include "raytracing.h"
 #include "vulkan_init.h"
+#include "profiler.h"
+#include "skeletal.h"
+#include "ibl.h"
 #include "../utils/vk_check.h"
 
 #include <imgui.h>
@@ -43,6 +46,21 @@ static std::string openObjFileDialog() {
     ofn.nMaxFile     = sizeof(buf);
     ofn.Flags        = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
     ofn.lpstrTitle   = "Import Model";
+    if (GetOpenFileNameA(&ofn)) return std::string(buf);
+#endif
+    return {};
+}
+
+static std::string openGltfFileDialog() {
+#ifdef _WIN32
+    char buf[MAX_PATH] = "";
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize  = sizeof(ofn);
+    ofn.lpstrFilter  = "glTF (*.gltf;*.glb)\0*.gltf;*.glb\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile    = buf;
+    ofn.nMaxFile     = sizeof(buf);
+    ofn.Flags        = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.lpstrTitle   = "Import glTF";
     if (GetOpenFileNameA(&ofn)) return std::string(buf);
 #endif
     return {};
@@ -117,7 +135,12 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
                       Camera& camera, ShadowData& shadow, PostFXSettings& postfx,
                       RtSettings& rt,
                       int visibleEntities, int totalEntities,
-                      float deltaTime)
+                      float deltaTime,
+                      const Profiler* profiler,
+                      const SkinnedMesh* skinnedMesh,
+                      IblBakeParams* iblParams,
+                      bool* iblRebuildRequest,
+                      std::string* pendingGltfLoad)
 {
     // FPS calc
     m_frameCount++;
@@ -166,6 +189,7 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
 
         ImGui::DockBuilderDockWindow("Hierarchy",        dockLeft);
         ImGui::DockBuilderDockWindow("Performance",      dockLeft);
+        ImGui::DockBuilderDockWindow("Frame Timing",     dockLeft);
         ImGui::DockBuilderDockWindow("Properties",       dockRight);
         ImGui::DockBuilderDockWindow("Lights",           dockRight);
         ImGui::DockBuilderDockWindow("Post-Processing",  dockBottom);
@@ -250,6 +274,15 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             }
         }
         ImGui::SameLine();
+        if (pendingGltfLoad && ImGui::Button("Import glTF (Skinned)...")) {
+            std::string p = openGltfFileDialog();
+            if (!p.empty()) {
+                // Engine picks this up after buildUI returns: it stalls the
+                // GPU, swaps the shared SkinnedMesh, and re-uploads. We just
+                // surface the request.
+                *pendingGltfLoad = p;
+            }
+        }
         if (ImGui::Button("Spawn Point Light")) {
             auto e = registry.create();
             registry.emplace<NameComponent>(e, std::string("Point Light"));
@@ -359,6 +392,44 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
     }
     ImGui::End();
 
+    // ── Frame Timing (GPU + CPU per-pass) ───────────────────────────────
+    if (ImGui::Begin("Frame Timing")) {
+        if (!profiler) {
+            ImGui::TextDisabled("Profiler not attached.");
+        } else {
+            // GPU column. Results are one frame behind by construction (we
+            // read back the previous use of this frame slot's query pool).
+            ImGui::TextDisabled("GPU (1 frame lag)");
+            if (!profiler->gpuAvailable()) {
+                ImGui::TextDisabled("  timestamps unsupported");
+            } else if (profiler->gpuResults().empty()) {
+                ImGui::TextDisabled("  warming up…");
+            } else {
+                double gpuTotal = 0.0;
+                for (auto& e : profiler->gpuResults()) gpuTotal += e.ms;
+                for (auto& e : profiler->gpuResults()) {
+                    ImGui::Text("  %-18s %6.3f ms", e.name, e.ms);
+                }
+                ImGui::Separator();
+                ImGui::Text("  %-18s %6.3f ms", "GPU total (sum)", gpuTotal);
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled("CPU (this frame)");
+            if (profiler->cpuResults().empty()) {
+                ImGui::TextDisabled("  no scopes");
+            } else {
+                double cpuTotal = 0.0;
+                for (auto& e : profiler->cpuResults()) cpuTotal += e.ms;
+                for (auto& e : profiler->cpuResults()) {
+                    ImGui::Text("  %-22s %6.3f ms", e.name, e.ms);
+                }
+                ImGui::Separator();
+                ImGui::Text("  %-22s %6.3f ms", "CPU total (sum)", cpuTotal);
+            }
+        }
+    }
+    ImGui::End();
+
     // ── Performance ─────────────────────────────────────────────────────
     if (ImGui::Begin("Performance")) {
         ImGui::Text("FPS: %.1f", m_displayFps);
@@ -397,6 +468,90 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
                     ImGui::ColorEdit4("Albedo Tint", &m->color.x);
                     ImGui::SliderFloat("Metallic",   &m->metallic,  0.0f, 1.0f);
                     ImGui::SliderFloat("Roughness",  &m->roughness, 0.04f, 1.0f);
+                    // Parallax (only useful when a height map is assigned).
+                    bool hasHeight = (m->heightTexture.id != 0);
+                    if (ImGui::Checkbox("Parallax (POM)", &hasHeight)) {
+                        // The user can't pick a texture here yet — toggling
+                        // just resets the slot to "none" if disabling. Asset
+                        // hookup arrives with the glTF importer.
+                        if (!hasHeight) m->heightTexture.id = 0;
+                    }
+                    if (m->heightTexture.id != 0) {
+                        ImGui::SliderFloat("Parallax Scale", &m->parallaxScale,
+                                           0.0f, 0.25f, "%.3f");
+                    }
+                }
+            }
+
+            if (auto* a = registry.try_get<AnimatorComponent>(e)) {
+                if (ImGui::CollapsingHeader("Animator", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (skinnedMesh && !skinnedMesh->animations.empty()) {
+                        const int clipCount = static_cast<int>(skinnedMesh->animations.size());
+                        a->animationIndex = std::clamp(a->animationIndex, 0, clipCount - 1);
+                        const auto& clip = skinnedMesh->animations[a->animationIndex];
+                        const float duration = clip.duration;
+
+                        // Clip combo
+                        const char* preview = clip.name.empty() ? "(unnamed)" : clip.name.c_str();
+                        if (ImGui::BeginCombo("Clip", preview)) {
+                            for (int i = 0; i < clipCount; ++i) {
+                                const auto& c = skinnedMesh->animations[i];
+                                const std::string label = c.name.empty()
+                                    ? ("clip " + std::to_string(i))
+                                    : c.name;
+                                bool sel = (i == a->animationIndex);
+                                if (ImGui::Selectable(label.c_str(), sel)) {
+                                    if (i != a->animationIndex) {
+                                        a->animationIndex = i;
+                                        a->time = 0.0f;
+                                    }
+                                }
+                                if (sel) ImGui::SetItemDefaultFocus();
+                            }
+                            ImGui::EndCombo();
+                        }
+
+                        // Transport buttons
+                        if (ImGui::Button(a->playing ? "Pause" : "Play")) {
+                            // If not looping and we're at the end, rewind on play.
+                            if (!a->playing && !a->loop && duration > 0.0f && a->time >= duration) {
+                                a->time = 0.0f;
+                            }
+                            a->playing = !a->playing;
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Stop")) {
+                            a->time    = 0.0f;
+                            a->playing = false;
+                        }
+                        ImGui::SameLine();
+                        ImGui::Checkbox("Loop", &a->loop);
+
+                        // Scrubber — dragging pauses, releasing restores prior state.
+                        float scrub = a->time;
+                        const float scrubMax = duration > 0.0f ? duration : 1.0f;
+                        ImGui::SliderFloat("Time", &scrub, 0.0f, scrubMax, "%.3f s");
+                        if (ImGui::IsItemActivated()) {
+                            m_animScrubWasPlaying = a->playing;
+                            a->playing = false;
+                        }
+                        if (ImGui::IsItemActive()) {
+                            a->time = scrub;
+                        }
+                        if (ImGui::IsItemDeactivatedAfterEdit()) {
+                            a->time    = scrub;
+                            a->playing = m_animScrubWasPlaying;
+                        }
+
+                        ImGui::DragFloat("Speed", &a->speed, 0.01f, -4.0f, 4.0f);
+
+                        ImGui::Separator();
+                        ImGui::Text("Duration: %.3f s", duration);
+                        ImGui::Text("Channels: %d", (int)clip.channels.size());
+                        ImGui::Text("Joints:   %d", (int)skinnedMesh->skeleton.joints.size());
+                    } else {
+                        ImGui::TextDisabled("No animations loaded.");
+                    }
                 }
             }
 
@@ -458,6 +613,40 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
     }
     ImGui::End();
 
+    // ── Environment / IBL panel ─────────────────────────────────────────
+    if (iblParams && iblRebuildRequest) {
+        if (ImGui::Begin("Environment")) {
+            ImGui::TextWrapped("Procedural sky + image-based lighting bake. "
+                               "Press Rebake after editing parameters or "
+                               "providing an HDR equirectangular path.");
+            ImGui::Separator();
+
+            ImGui::DragFloat3("Sun Direction", &iblParams->sunDir.x, 0.05f, -1.0f, 1.0f);
+            ImGui::DragFloat ("Sun Intensity", &iblParams->sunIntensity, 0.05f, 0.0f, 32.0f);
+            ImGui::SliderFloat("IBL Intensity", &iblParams->intensity, 0.0f, 2.0f, "%.3f");
+            ImGui::ColorEdit3("Zenith",  &iblParams->zenithColor.x);
+            ImGui::ColorEdit3("Horizon", &iblParams->horizonColor.x);
+            ImGui::ColorEdit3("Ground",  &iblParams->groundColor.x);
+
+            char buf[260];
+            std::strncpy(buf, iblParams->hdrPath.c_str(), sizeof(buf));
+            buf[sizeof(buf) - 1] = '\0';
+            if (ImGui::InputText("HDR equirect (.hdr)", buf, sizeof(buf))) {
+                iblParams->hdrPath = buf;
+            }
+
+            if (ImGui::Button("Rebake")) {
+                *iblRebuildRequest = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear HDR (procedural)")) {
+                iblParams->hdrPath.clear();
+                *iblRebuildRequest = true;
+            }
+        }
+        ImGui::End();
+    }
+
     // ── Post-Processing ─────────────────────────────────────────────────
     if (ImGui::Begin("Post-Processing")) {
         if (ImGui::CollapsingHeader("Debug View", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -515,6 +704,57 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
         } else {
             ImGui::Text("RT supported: BLAS/TLAS + ray queries available");
             ImGui::Separator();
+
+            // Presets — apply curated rt + post-fx combos with one click. The
+            // sliders below remain editable so you can tune any preset.
+            ImGui::TextDisabled("Presets");
+            if (ImGui::Button("Off (Classic)")) {
+                rt.enabled            = false;
+                rt.shadows            = false;
+                rt.reflections        = false;
+                rt.gi                 = false;
+                postfx.ssaoEnabled    = true;
+                postfx.ssaoStrength   = 0.5f;
+                postfx.bloomEnabled   = false;       // kills the chrome-edge halo
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("RT (Clean)")) {
+                rt.enabled            = true;
+                rt.shadows            = true;
+                rt.reflections        = true;
+                rt.gi                 = false;       // skip GI → no Monte-Carlo grain
+                rt.sunOnly            = true;
+                rt.shadowSoftness     = 0.005f;
+                rt.shadowSamples      = 16;
+                rt.reflectionSamples  = 4;
+                rt.reflectionIntensity = 1.0f;
+                postfx.ssaoEnabled    = false;       // RT shadows replace SSAO
+                postfx.bloomEnabled   = true;
+                postfx.bloomStrength  = 0.04f;
+                postfx.bloomThreshold = 1.5f;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("RT (Full)")) {
+                rt.enabled            = true;
+                rt.shadows            = true;
+                rt.reflections        = true;
+                rt.gi                 = true;
+                rt.sunOnly            = true;
+                rt.shadowSamples      = 16;
+                rt.reflectionSamples  = 4;
+                // GI quality knobs: 48 samples is ~2× quieter than the old
+                // 12-sample default (variance ~ 1/√N). Costs ~3× more rays
+                // per pixel, but RT GI was severely under-sampled before.
+                // mix at 0.25 lets the GI color-bleed actually show.
+                rt.giSamples          = 48;
+                rt.giIntensity        = 0.25f;
+                postfx.ssaoEnabled    = false;
+                postfx.bloomEnabled   = true;
+                postfx.bloomStrength  = 0.05f;
+                postfx.bloomThreshold = 1.5f;
+            }
+            ImGui::Separator();
+
             ImGui::Checkbox("Enable Ray Tracing", &rt.enabled);
             ImGui::BeginDisabled(!rt.enabled);
             ImGui::Checkbox("RT Shadows (replaces CSM)", &rt.shadows);
@@ -537,7 +777,7 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             ImGui::Checkbox("RT Global Illumination", &rt.gi);
             ImGui::TextDisabled("One-bounce indirect — replaces hemisphere ambient");
             ImGui::BeginDisabled(!rt.gi);
-            ImGui::SliderInt("GI samples", &rt.giSamples, 1, 16);
+            ImGui::SliderInt("GI samples", &rt.giSamples, 1, 64);
             ImGui::SliderFloat("GI max dist", &rt.giMaxDist, 5.0f, 100.0f, "%.0f");
             ImGui::SliderFloat("GI mix (0=smooth, 1=full RT)", &rt.giIntensity, 0.0f, 1.0f);
             ImGui::EndDisabled();

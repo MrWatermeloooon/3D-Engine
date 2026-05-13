@@ -4,6 +4,12 @@
 #extension GL_EXT_buffer_reference                           : require
 #extension GL_EXT_scalar_block_layout                        : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64     : require
+// Subgroup quad ops let the 4 fragments of a 2x2 pixel quad share data with
+// each other. We use them to spatially average the noisy RT-GI signal —
+// effectively quadrupling its sample count for free, since each fragment in
+// the quad has already done its own hemisphere sampling with a different
+// seed. Standard Vulkan 1.1+; supported on every modern desktop GPU.
+#extension GL_KHR_shader_subgroup_quad                       : require
 
 const float PI = 3.14159265359;
 const int   MAX_LIGHTS    = 32;
@@ -13,9 +19,12 @@ layout(location = 0) in vec3 vColor;
 layout(location = 1) in vec2 vTexCoord;
 layout(location = 2) in vec3 vNormal;
 layout(location = 3) in vec3 vWorldPos;
-layout(location = 4) in vec3 vViewPos;
+layout(location = 4) in vec4 vViewPos;
 layout(location = 5) flat in vec4 vColorTint;
 layout(location = 6) flat in vec4 vMatParams;
+layout(location = 7) in vec4 vPrevClipPos;
+layout(location = 8) in vec3 vTangent;
+layout(location = 9) flat in vec4 vMatParams2;  // x=heightSlot, y=parallaxScale
 
 layout(set = 0, binding = 0) uniform SceneUBO {
     mat4 view;
@@ -50,14 +59,21 @@ layout(set = 0, binding = 2) uniform CascadeUBO {
 
 layout(set = 0, binding = 3) uniform sampler2DArrayShadow shadowMap;
 layout(set = 0, binding = 4) uniform accelerationStructureEXT topLevelAS;
+// IBL: irradiance for diffuse, prefilter for specular, BRDF LUT for split-sum.
+layout(set = 0, binding = 6) uniform samplerCube irradianceMap;
+layout(set = 0, binding = 7) uniform samplerCube prefilterMap;
+layout(set = 0, binding = 8) uniform sampler2D   brdfLUT;
 
 // Vertex layout mirrors C++ `Vertex` (vertex.h) with scalar layout to avoid
-// vec3 std140 padding. position, normal, texCoord, color = 12+12+8+12 = 44 B.
+// vec3 std140 padding. position, normal, texCoord, color, tangent =
+// 12+12+8+12+12 = 56 B. Must match C++ Vertex exactly — the buffer-reference
+// walks this stride.
 struct VertexRT {
     vec3 position;
     vec3 normal;
     vec2 texCoord;
     vec3 color;
+    vec3 tangent;
 };
 
 layout(buffer_reference, scalar) readonly buffer Vertices { VertexRT v[]; };
@@ -168,7 +184,11 @@ float rtShadow(vec3 worldPos, vec3 N, vec3 toLightDir, float tMax, uint seedBase
     // Offset the origin along the normal to avoid self-shadowing on coarse
     // geometry (cube faces in particular were getting acne at 0.002).
     vec3 origin = worldPos + N * 0.01;
-    float cosMax = cos(scene.rtParams.y);
+    // Clamp angular radius to [0, π/2]. Values past π/2 make sampleCone
+    // return directions pointing back into the surface, which produces
+    // false self-shadowing on every fragment.
+    float angularRadius = clamp(scene.rtParams.y, 0.0, 1.5707);
+    float cosMax = cos(angularRadius);
     int samples = clamp(int(scene.rtParams.z), 1, 64);
     float acc = 0.0;
     uint seed = seedBase;
@@ -226,6 +246,10 @@ vec3 shadeReflectionHit(rayQueryEXT q, vec3 rayOrigin, vec3 rayDir,
     vec3 hitN = normalize(normalMat * nObj);
 
     float t = rayQueryGetIntersectionTEXT(q, true);
+    // Degenerate BLAS construction can occasionally produce committed hits with
+    // negative T (geometry behind the ray origin). Bias the secondary ray's
+    // origin past that, but reject the shaded value entirely if t is non-positive.
+    if (t <= 0.0001) return vec3(0.0);
     vec3 hitP = rayOrigin + rayDir * t;
 
     // Sun shadow at the hit (single ray — soft shadow would be expensive
@@ -265,7 +289,10 @@ vec3 sampleCosineHemisphere(vec3 N, inout uint seed) {
 vec3 rtGI(vec3 worldPos, vec3 N, vec3 sunToLight, vec3 sunRadiance,
           inout uint seed)
 {
-    int samples = clamp(int(scene.rtParams3.y), 1, 16);
+    // Cap bumped from 16 to 64 so the "GI samples" slider can actually buy
+    // less noise. Variance drops as 1/sqrt(N), so 64 samples cuts grain
+    // ~halfway between 16-sample-noisy and pure-smooth.
+    int samples = clamp(int(scene.rtParams3.y), 1, 64);
     float tMax = scene.rtParams3.z;
     vec3 origin = worldPos + N * 0.01;
 
@@ -422,14 +449,92 @@ vec3 evaluateLight(Light L, vec3 N, vec3 V, vec3 worldPos, vec3 albedo, vec3 F0,
     return (kD * albedo / PI + specular) * radiance * NdotL;
 }
 
+// ── Parallax-occlusion mapping ──────────────────────────────────────────────
+// Tangent-space step march along the view ray. Returns the UV at which the
+// view ray first dips below the height field. `Vt` is the tangent-space view
+// direction (camera-toward-fragment, in TBN coords). Adaptive step count
+// (more steps at grazing angles, fewer at near-normal incidence) keeps the
+// average tap cost low while preventing layer-stepping artifacts at the
+// silhouette.
+//
+// Uses the convention "height 1.0 = fully popped out toward the camera": the
+// rendered surface is at depth 0 (top of layer stack) and the texture's
+// height map sample is *subtracted* from a virtual layer depth that runs
+// 0→1 along the view ray. We sample (1 - height) so a brighter texel reads
+// as "higher" and pops toward the camera.
+vec2 parallaxOffsetUV(vec2 uv, vec3 Vt, int heightSlot, float depthScale) {
+    if (heightSlot <= 0 || depthScale <= 0.0) return uv;
+
+    // Vt.z is dot(N, V) in tangent space — flatten the cone when looking
+    // straight down to avoid divide-by-zero. Step count scales with grazing.
+    float nDotV = max(Vt.z, 0.05);
+    int   steps = int(mix(32.0, 8.0, nDotV));
+
+    float layerDepth   = 1.0 / float(steps);
+    float currentDepth = 0.0;
+    // Parallax shifts UV opposite the view direction (we look "down" into the
+    // layer stack). xy of Vt is the in-plane component; divide by z for the
+    // perspective-correct shift, then scale by depth.
+    vec2  deltaUV = (Vt.xy / nDotV) * depthScale * layerDepth;
+    vec2  curUV   = uv;
+
+    float h = 1.0 - texture(bindlessTextures[nonuniformEXT(heightSlot)], curUV).r;
+    // March until the ray drops below the surface.
+    for (int i = 0; i < 64; ++i) {
+        if (currentDepth >= h) break;
+        curUV         -= deltaUV;
+        currentDepth  += layerDepth;
+        h = 1.0 - texture(bindlessTextures[nonuniformEXT(heightSlot)], curUV).r;
+        if (i >= steps) break;
+    }
+
+    // Binary-search refinement: one bisection between the last two layers
+    // resolves the silhouette without needing a much higher base step count.
+    vec2  prevUV    = curUV + deltaUV;
+    float afterH    = h - currentDepth;
+    float beforeH   = (1.0 - texture(bindlessTextures[nonuniformEXT(heightSlot)], prevUV).r)
+                      - (currentDepth - layerDepth);
+    float w = afterH / max(afterH - beforeH, 1e-5);
+    return mix(curUV, prevUV, w);
+}
+
 void main() {
+    int   heightSlot    = int(vMatParams2.x);
+    float parallaxScale = vMatParams2.y;
+
+    // Parallax happens BEFORE any UV-derived sample (albedo, normal). The
+    // view direction needs to be in tangent space, which requires a TBN
+    // built once here and reused below for normal mapping.
+    vec3 geomN  = normalize(vNormal);
+    vec3 geomT  = normalize(vTangent - dot(vTangent, geomN) * geomN);
+    vec3 geomB  = cross(geomN, geomT);
+    mat3 TBN    = mat3(geomT, geomB, geomN);
+
+    vec3 Vworld = normalize(scene.cameraPos.xyz - vWorldPos);
+    vec3 Vtan   = transpose(TBN) * Vworld;
+    vec2 uv     = parallaxOffsetUV(vTexCoord, Vtan, heightSlot, parallaxScale);
+
     int textureIndex = int(vMatParams.z);
-    vec3 albedoSample = texture(bindlessTextures[nonuniformEXT(textureIndex)], vTexCoord).rgb;
+    vec3 albedoSample = texture(bindlessTextures[nonuniformEXT(textureIndex)], uv).rgb;
     vec3 albedo       = albedoSample * vColor * vColorTint.rgb;
     float metallic    = vMatParams.x;
     float roughness   = clamp(vMatParams.y, 0.04, 1.0);
 
-    vec3 N = normalize(vNormal);
+    vec3 N = geomN;
+
+    // ── Tangent-space normal mapping ────────────────────────────────────
+    // matParams.w carries the bindless texture slot for the per-material
+    // normal map. Slot 0 is reserved as the default white texture in the
+    // resource manager — we treat "0" as "no normal map" and skip the
+    // mapping. Uses the parallax-offset UV so normals follow the displaced
+    // surface.
+    int normalMapIndex = int(vMatParams.w);
+    if (normalMapIndex > 0) {
+        vec3 nmSample = texture(bindlessTextures[nonuniformEXT(normalMapIndex)], uv).xyz;
+        vec3 nm  = normalize(nmSample * 2.0 - 1.0);
+        N = normalize(TBN * nm);
+    }
+
     vec3 V = normalize(scene.cameraPos.xyz - vWorldPos);
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
@@ -502,79 +607,87 @@ void main() {
         Lo += directionalLo * shadowFactor;
     }
 
-    // ── Indirect lighting (energy-conserving split) ────────────────────────
-    // Dielectric diffuse + metallic specular don't overlap. Without this
-    // split, metals double-up (ambient + reflection) and look washed out;
-    // dielectrics double-up too (ambient + tiny grazing reflection).
-    vec3 F_indirect = fresnelSchlick(max(dot(N, V), 0.0), F0);
+    // ── Indirect lighting (split-sum IBL) ──────────────────────────────────
+    // Energy-conserving: dielectric diffuse and metallic specular don't
+    // overlap. Diffuse weight is kD = (1 - F) * (1 - metallic); specular
+    // weight is F. Roughness-aware Fresnel keeps grazing-angle highlights
+    // sane on rough materials.
+    //
+    // IBL_EXPOSURE scales the IBL contribution to surface shading
+    // independently of how bright the env cubemap is for sky display.
+    // Without this split, choosing a sky brightness either over-lights
+    // surfaces or leaves the sky too dim — they're separate concerns. 0.18
+    // matches the magnitude of the engine's legacy `hemiAmbient * 0.18`
+    // static-ambient term, so swapping IBL on/off doesn't change overall
+    // scene brightness materially.
+    const float IBL_EXPOSURE = 0.18;
 
-    // Hemisphere diffuse: only applies to the diffuse portion. Metals get
-    // none of this — their indirect lighting is purely the RT reflection.
-    // When RT GI is enabled, sample the real scene radiance via ray queries
-    // instead of the static hemisphere — gives color bleed + true ambient
-    // occlusion as a side effect.
-    vec3 skyColor      = vec3(0.45, 0.55, 0.70);
-    vec3 groundColor   = vec3(0.18, 0.16, 0.14);
-    float hemi         = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3 hemiAmbient   = mix(groundColor, skyColor, hemi);
-    vec3 kD_indirect   = (1.0 - F_indirect) * (1.0 - metallic);
+    float NdotV = max(dot(N, V), 0.0);
+    vec3  F_indirect = F0 + (max(vec3(1.0 - roughness), F0) - F0)
+                           * pow(clamp(1.0 - NdotV, 0.0, 1.0), 5.0);
+    vec3  kD_indirect = (1.0 - F_indirect) * (1.0 - metallic);
 
-    // Static hemisphere ambient — smooth, noise-free fallback.
-    vec3 staticAmbient = kD_indirect * albedo * hemiAmbient * 0.18;
+    // Diffuse: integrated environment radiance over the upper hemisphere.
+    vec3 irradiance     = texture(irradianceMap, N).rgb;
+    vec3 diffuseIndirect = kD_indirect * albedo * irradiance * IBL_EXPOSURE;
 
-    vec3 diffuseIndirect = staticAmbient;
+    // Mix RT GI in when enabled. The ray-traced radiance is single-frame
+    // Monte Carlo. Two layers of noise reduction:
+    //   * 0.5 attenuation on the giAmbient term so the contribution at any
+    //     given rtParams3.w mix factor is half — matches the prior tuning.
+    //   * subgroup quad-average shares each fragment's GI estimate with its
+    //     3 neighbours in the 2x2 pixel quad. Each neighbour ran a different
+    //     hemisphere sample set (the seed is per-pixel), so this effectively
+    //     quadruples the sample budget at zero ray cost. Slight 2x2 spatial
+    //     blur — fine for low-frequency GI, occasional artefacts on triangle
+    //     edges where the quad straddles two primitives.
     if (scene.rtParams3.x > 0.5 && metallic < 0.5) {
         vec3 giRadiance = rtGI(vWorldPos, N, sunToLight, sunRadiance, seed);
-        // RT GI contribution scaled to roughly match the static ambient
-        // magnitude so the mix doesn't drastically change overall brightness.
-        vec3 giAmbient = kD_indirect * albedo * giRadiance * 0.5;
-        // rtParams3.w acts as the GI/ambient mix factor:
-        //   0 → pure smooth ambient (no GI flavor, no noise)
-        //   1 → pure ray-traced GI (full color bleed, full noise)
-        // Default 0.3 keeps the look mostly smooth with subtle color bleed.
-        diffuseIndirect = mix(staticAmbient, giAmbient, scene.rtParams3.w);
+        vec3 quadSum  = giRadiance;
+        quadSum += subgroupQuadSwapHorizontal(giRadiance);
+        quadSum += subgroupQuadSwapVertical(giRadiance);
+        quadSum += subgroupQuadSwapDiagonal(giRadiance);
+        giRadiance = quadSum * 0.25;
+
+        vec3 giAmbient  = kD_indirect * albedo * giRadiance * 0.5;
+        diffuseIndirect = mix(diffuseIndirect, giAmbient, scene.rtParams3.w);
     }
 
-    // Specular indirect via RT. Skipped for very rough surfaces (would be
-    // pure noise). Reflection intensity multiplier in rtParams2.w lets the
-    // user dial reflections up/down for taste.
-    vec3 specIndirect = vec3(0.0);
-    // RT reflections only on metallic surfaces. Real dielectric plastic has
-    // weak grazing-angle reflections, but for this engine's aesthetic we
-    // gate them out — keeps plastics fully diffuse and reflection-noise free.
+    // Specular: split-sum approximation. textureLod into the prefiltered
+    // cube at a mip determined by roughness; multiply by F*scale + bias from
+    // the BRDF LUT. Matches Epic's UE4 IBL paper.
+    vec3  R           = reflect(-V, N);
+    float maxReflLod  = float(textureQueryLevels(prefilterMap)) - 1.0;
+    vec3  prefiltered = textureLod(prefilterMap, R, roughness * maxReflLod).rgb;
+    vec2  envBRDF     = texture(brdfLUT, vec2(NdotV, roughness)).rg;
+    vec3  iblSpecular = prefiltered * (F_indirect * envBRDF.x + envBRDF.y) * IBL_EXPOSURE;
+
+    // RT reflections override IBL specular for metallic surfaces when on —
+    // they trace true scene reflections that the prefilter can't capture.
     if (scene.rtParams2.x > 0.5 && roughness < 0.85 && metallic > 0.5) {
         vec3 reflColor = rtReflection(vWorldPos, N, V, roughness,
                                       sunToLight, sunRadiance, seed);
-        specIndirect = F_indirect * reflColor * scene.rtParams2.w;
-    } else if (metallic > 0.5) {
-        // Without RT reflection a metal would have zero indirect light.
-        // Fall back to a flat F_indirect * hemiSky so metals don't go black
-        // when reflections are disabled.
-        specIndirect = F_indirect * hemiAmbient * 0.5;
+        iblSpecular = F_indirect * reflColor * scene.rtParams2.w;
     }
 
-    vec3 color = diffuseIndirect + specIndirect + Lo;
+    vec3 color = diffuseIndirect + iblSpecular + Lo;
 
     // Output linear HDR — composite pass handles tone mapping + gamma
     outColor = vec4(color, 1.0);
 
     // ── Motion vector ────────────────────────────────────────────────────
-    // Reproject this fragment through both the current and previous-frame
-    // view-projection. Output (prevNDC - currNDC) in NDC units.
+    // Per-OBJECT motion: prevClipPos comes from the per-instance prevModel
+    // (per-vertex prev world position × scene.prevViewProj, interpolated
+    // here). currClip is the current world position through the current
+    // view-proj. Output (prev - curr) in NDC units.
     //
-    // The camera proj has had `+jitterNDC` added to proj[2][0]/[2][1]; the
-    // perspective W-divide turns that into a NDC shift of `-jitterNDC`. So:
-    //   jittered_NDC = unjittered_NDC - jitterNDC
-    // To recover the unjittered position, *add* jitterOffset back. (Subtracting
-    // it — as a previous version did — actually doubles the jitter and
-    // produces a per-frame shake on static geometry.)
-    //
-    // scene.prevViewProj is the UN-jittered previous-frame view×proj (set
-    // engine-side from the camera matrices, not from the jittered ubo.proj),
-    // so prevNDC is already unjittered — no correction needed there.
+    // Jitter handling: the camera proj has `+jitterNDC` added to proj[2][0/1];
+    // post-W-divide that yields a NDC shift of `-jitterNDC`. To recover the
+    // unjittered current NDC, add jitterOffset back. scene.prevViewProj is
+    // the UN-jittered prev view-proj (set engine-side from raw camera
+    // matrices), so prevNDC needs no correction.
     vec4 currClip = scene.proj * scene.view * vec4(vWorldPos, 1.0);
-    vec4 prevClip = scene.prevViewProj         * vec4(vWorldPos, 1.0);
     vec2 currNDC = currClip.xy / currClip.w + scene.jitterOffset.xy;
-    vec2 prevNDC = prevClip.xy / prevClip.w;
+    vec2 prevNDC = vPrevClipPos.xy / vPrevClipPos.w;
     outMotion = prevNDC - currNDC;
 }

@@ -13,6 +13,7 @@ find_package(Stb REQUIRED)
 find_package(EnTT CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(imguizmo CONFIG REQUIRED)
+find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 
 # ── Source files ──────────────────────────────────────────────
 set(SOURCES
@@ -42,6 +43,12 @@ set(SOURCES
     src/engine/gpu_cull.cpp
     src/engine/hzb.cpp
     src/engine/raytracing.cpp
+    src/engine/sky.cpp
+    src/engine/profiler.cpp
+    src/engine/vma_impl.cpp
+    src/engine/spatial.cpp
+    src/engine/ibl.cpp
+    src/engine/gltf_loader.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
@@ -50,6 +57,13 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     GLM_FORCE_DEPTH_ZERO_TO_ONE
     GLM_FORCE_RADIANS
 )
+
+# MSVC: enable synchronous C++ exception handling. The default in some CMake
+# generator configs (Release in particular) leaves /EHsc off, which means
+# VK_CHECK's `throw` would crash at runtime instead of unwinding cleanly.
+if (MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /EHsc)
+endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -64,6 +78,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     EnTT::EnTT
     imgui::imgui
     imguizmo::imguizmo
+    GPUOpen::VulkanMemoryAllocator
 )
 
 # ── Shader compilation (GLSL → SPIR-V) ───────────────────────
@@ -87,6 +102,13 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/mesh_skinned.vert
     ${SHADER_SOURCE_DIR}/cull.comp
     ${SHADER_SOURCE_DIR}/hzb_reduce.comp
+    ${SHADER_SOURCE_DIR}/sky.vert
+    ${SHADER_SOURCE_DIR}/sky.frag
+    ${SHADER_SOURCE_DIR}/shadow_skinned.vert
+    ${SHADER_SOURCE_DIR}/ibl_env.comp
+    ${SHADER_SOURCE_DIR}/ibl_irradiance.comp
+    ${SHADER_SOURCE_DIR}/ibl_prefilter.comp
+    ${SHADER_SOURCE_DIR}/ibl_brdf.comp
 )
 
 set(SHADER_OUTPUTS "")

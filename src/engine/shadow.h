@@ -5,9 +5,12 @@
 #include <vector>
 
 #include "buffer.h"
+#include "config.h"
 
-constexpr uint32_t SHADOW_CASCADE_COUNT = 4;
-constexpr uint32_t SHADOW_MAP_SIZE      = 2048;
+#include <vk_mem_alloc.h>
+
+using engine_config::SHADOW_CASCADE_COUNT;
+using engine_config::SHADOW_MAP_SIZE;
 constexpr VkFormat SHADOW_FORMAT        = VK_FORMAT_D32_SFLOAT;
 
 struct CascadeUBO {
@@ -17,7 +20,7 @@ struct CascadeUBO {
 
 struct ShadowData {
     VkImage         image      = VK_NULL_HANDLE;
-    VkDeviceMemory  memory     = VK_NULL_HANDLE;
+    VmaAllocation   allocation = VK_NULL_HANDLE;
     VkImageView     arrayView  = VK_NULL_HANDLE;             // sampled in main pass
     VkImageView     layerViews[SHADOW_CASCADE_COUNT]{};      // per-cascade attachments
     VkFramebuffer   framebuffers[SHADOW_CASCADE_COUNT]{};

@@ -1,0 +1,84 @@
+#version 450
+
+// Bake an environment cubemap. Two source modes selected by push constant:
+//   sourceMode = 0  → procedural sky (hemisphere gradient + sun disc).
+//   sourceMode = 1  → equirectangular HDR sampled as set=0 binding 1.
+//
+// One dispatch per face, indexed by gl_GlobalInvocationID.z (0..5). XY index
+// the destination texel within a face.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint  sourceMode;
+    uint  faceSize;
+    float sunIntensity;        // matches the sky.frag sun intensity hint
+    float intensity;           // global env scale — see IblBakeParams::intensity
+    vec4  sunDirection;        // .xyz, world-space (toward sun)
+    vec4  zenithColor;         // procedural sky params; only used when sourceMode == 0
+    vec4  horizonColor;
+    vec4  groundColor;
+} pc;
+
+layout(set = 0, binding = 0, rgba16f) writeonly uniform imageCube envCube;
+layout(set = 0, binding = 1)          uniform sampler2D       equirect;
+
+// Map (face, uv ∈ [0,1]²) → world-space direction. Face index follows the
+// Vulkan / D3D cubemap convention: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. Each face
+// is sampled in its own 2D coordinate system where (u, v) ∈ [0, 1].
+vec3 dirFromCubeFace(uint face, vec2 uv) {
+    vec2 t = uv * 2.0 - 1.0;
+    vec3 d;
+    switch (face) {
+        case 0u: d = vec3( 1.0, -t.y, -t.x); break;  // +X
+        case 1u: d = vec3(-1.0, -t.y,  t.x); break;  // -X
+        case 2u: d = vec3( t.x,  1.0,  t.y); break;  // +Y
+        case 3u: d = vec3( t.x, -1.0, -t.y); break;  // -Y
+        case 4u: d = vec3( t.x, -t.y,  1.0); break;  // +Z
+        default: d = vec3(-t.x, -t.y, -1.0); break;  // -Z
+    }
+    return normalize(d);
+}
+
+vec3 proceduralSky(vec3 dir) {
+    // Hemisphere gradient by elevation. dir.y ∈ [-1, 1].
+    float y = clamp(dir.y, -1.0, 1.0);
+    vec3 col;
+    if (y >= 0.0) {
+        float t = pow(y, 0.6);              // ease toward zenith
+        col = mix(pc.horizonColor.rgb, pc.zenithColor.rgb, t);
+    } else {
+        col = mix(pc.horizonColor.rgb, pc.groundColor.rgb, -y);
+    }
+    // Sun disc + soft halo. cosTheta ≈ 0.9999 → ~0.8° disc.
+    vec3 sun = normalize(pc.sunDirection.xyz);
+    float ct = dot(dir, sun);
+    float disc = smoothstep(0.9995, 0.99985, ct);
+    float halo = pow(max(ct, 0.0), 256.0) * 0.3;
+    col += pc.sunDirection.w * pc.sunIntensity * (disc + halo) * vec3(1.0, 0.95, 0.85);
+    return col;
+}
+
+vec3 sampleEquirect(vec3 dir) {
+    // dir → (lon, lat) → uv
+    float lon = atan(dir.z, dir.x);          // [-π, π]
+    float lat = asin(clamp(dir.y, -1.0, 1.0)); // [-π/2, π/2]
+    vec2 uv = vec2(lon * (0.5 / 3.14159265),
+                   lat * (1.0 / 3.14159265) + 0.5);
+    uv.x += 0.5;
+    return textureLod(equirect, uv, 0.0).rgb;
+}
+
+void main() {
+    uvec2 xy   = gl_GlobalInvocationID.xy;
+    uint  face = gl_GlobalInvocationID.z;
+    if (xy.x >= pc.faceSize || xy.y >= pc.faceSize || face >= 6u) return;
+
+    vec2 uv  = (vec2(xy) + 0.5) / float(pc.faceSize);
+    vec3 dir = dirFromCubeFace(face, uv);
+
+    vec3 col = (pc.sourceMode == 0u) ? proceduralSky(dir) : sampleEquirect(dir);
+    col *= pc.intensity;
+
+    imageStore(envCube, ivec3(int(xy.x), int(xy.y), int(face)), vec4(col, 1.0));
+}

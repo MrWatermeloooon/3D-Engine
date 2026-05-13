@@ -22,6 +22,12 @@
 #include "gpu_cull.h"
 #include "hzb.h"
 #include "raytracing.h"
+#include "sky.h"
+#include "ibl.h"
+#include "profiler.h"
+
+#include <memory>
+#include <unordered_map>
 
 class Engine {
 public:
@@ -38,11 +44,16 @@ private:
     void recreateSwapchain();
     void processInput(double deltaTime);
 
-    Window*          m_window = nullptr;
+    std::unique_ptr<Window> m_window;
     VulkanContext    m_vk{};
     SwapchainData    m_swapchain{};
     PipelineData     m_pipeline{};
     PipelineData     m_shadowPipeline{};
+    SkyData          m_sky{};
+    IblData          m_ibl{};
+    IblBakeParams    m_iblParams{};
+    bool             m_iblRebuildRequested = true;
+    std::string      m_pendingGltfLoad;
     RendererData     m_renderer{};
     DescriptorData   m_descriptors{};
     Camera           m_camera;
@@ -72,7 +83,9 @@ private:
     glm::mat4          m_prevViewProjMotion{1.0f}; // un-jittered, for motion vectors
 
 public:
-    RtSettings&   rtSettings()   { return m_rtSettings; }
+    RtSettings&    rtSettings()        { return m_rtSettings; }
+    IblBakeParams& iblParams()         { return m_iblParams; }
+    bool&          iblRebuildRequest() { return m_iblRebuildRequested; }
 
 private:
 
@@ -82,9 +95,15 @@ private:
     glm::mat4          m_prevViewProj{1.0f};
     bool               m_hasPrevVP = false;
 
+    // Per-entity previous world matrix for motion vectors. Updated at the end
+    // of each successful frame. Entities that disappear are pruned by checking
+    // registry.valid() on read.
+    std::unordered_map<entt::entity, glm::mat4> m_prevTransforms;
+
     // Skeletal animation
     SkinnedMesh                  m_skinnedMesh;
     PipelineData                 m_skinnedPipeline;
+    PipelineData                 m_skinnedShadowPipeline;
     VkDescriptorSetLayout        m_boneSetLayout = VK_NULL_HANDLE;
     std::vector<AllocatedBuffer> m_boneUbos;
     std::vector<void*>           m_boneMapped;
@@ -103,6 +122,13 @@ private:
 
     // Job system
     JobSystem        m_jobs;
+
+    // Per-frame profiler (GPU timestamps + CPU scopes).
+    Profiler         m_profiler;
+
+public:
+    const Profiler&  profiler() const { return m_profiler; }
+private:
 
     // Per-frame stats
     int    m_visibleEntities = 0;

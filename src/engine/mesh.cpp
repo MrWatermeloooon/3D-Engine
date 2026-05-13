@@ -12,6 +12,49 @@
 #include <cmath>
 #include <algorithm>
 
+// Compute smooth tangents using the standard Lengyel method
+// (https://terathon.com/blogs/tangent-space.html). For each triangle, build a
+// tangent from position + UV deltas, accumulate onto each vertex, then
+// orthogonalize against the vertex normal. Vertices with zero-area UVs (e.g.
+// degenerate triangles or meshes without UV unwrap) fall back to a vector
+// orthogonal to the normal so the TBN basis stays well-formed.
+void computeMeshTangents(Mesh& mesh) {
+    for (auto& v : mesh.vertices) v.tangent = glm::vec3(0.0f);
+
+    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+        Vertex& v0 = mesh.vertices[mesh.indices[i + 0]];
+        Vertex& v1 = mesh.vertices[mesh.indices[i + 1]];
+        Vertex& v2 = mesh.vertices[mesh.indices[i + 2]];
+
+        glm::vec3 dp1 = v1.position - v0.position;
+        glm::vec3 dp2 = v2.position - v0.position;
+        glm::vec2 du1 = v1.texCoord - v0.texCoord;
+        glm::vec2 du2 = v2.texCoord - v0.texCoord;
+
+        float r = du1.x * du2.y - du2.x * du1.y;
+        if (glm::abs(r) < 1e-8f) continue; // degenerate UV — skip
+        float invR = 1.0f / r;
+
+        glm::vec3 t = (dp1 * du2.y - dp2 * du1.y) * invR;
+        v0.tangent += t; v1.tangent += t; v2.tangent += t;
+    }
+
+    // Orthogonalize against normal + normalize. Fall back to an arbitrary
+    // orthonormal axis if the accumulated tangent collapses (zero-UV mesh).
+    for (auto& v : mesh.vertices) {
+        glm::vec3 n = v.normal;
+        glm::vec3 t = v.tangent - n * glm::dot(n, v.tangent);
+        float len = glm::length(t);
+        if (len > 1e-6f) {
+            v.tangent = t / len;
+        } else {
+            // Pick the world axis least aligned with n, then orthogonalize.
+            glm::vec3 a = (glm::abs(n.x) < 0.9f) ? glm::vec3(1, 0, 0) : glm::vec3(0, 1, 0);
+            v.tangent = glm::normalize(a - n * glm::dot(n, a));
+        }
+    }
+}
+
 Mesh loadMeshFromObj(const std::string& filepath) {
     tinyobj::attrib_t attrib;
     std::vector<tinyobj::shape_t> shapes;
@@ -19,7 +62,7 @@ Mesh loadMeshFromObj(const std::string& filepath) {
     std::string warn, err;
 
     if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, filepath.c_str())) {
-        throw std::runtime_error("Failed to load OBJ: " + warn + err);
+        throw std::runtime_error("Failed to load OBJ: warn=\"" + warn + "\" err=\"" + err + "\"");
     }
 
     Mesh mesh;
@@ -64,6 +107,9 @@ Mesh loadMeshFromObj(const std::string& filepath) {
     }
 
     // If the OBJ had no normals, compute smooth ones from triangle face normals.
+    // Use the raw (un-normalized) cross product so each triangle's contribution
+    // is proportional to its area — otherwise a tiny degenerate sliver weighs
+    // equally with a large face it shares a vertex with and skews the result.
     if (attrib.normals.empty()) {
         for (auto& v : mesh.vertices) v.normal = glm::vec3(0.0f);
         for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
@@ -72,9 +118,7 @@ Mesh loadMeshFromObj(const std::string& filepath) {
             auto& v2 = mesh.vertices[mesh.indices[i + 2]];
             glm::vec3 e1 = v1.position - v0.position;
             glm::vec3 e2 = v2.position - v0.position;
-            glm::vec3 n  = glm::cross(e1, e2);
-            float len = glm::length(n);
-            if (len > 1e-8f) n /= len;
+            glm::vec3 n  = glm::cross(e1, e2);  // length = 2 * triangle area
             v0.normal += n; v1.normal += n; v2.normal += n;
         }
         for (auto& v : mesh.vertices) {
@@ -82,6 +126,13 @@ Mesh loadMeshFromObj(const std::string& filepath) {
             v.normal = (len > 1e-6f) ? v.normal / len : glm::vec3(0, 1, 0);
         }
     }
+
+    // Compute per-vertex tangents from position+UV deltas (Lengyel's method).
+    // Tangents are needed for tangent-space normal mapping in mesh.frag.
+    // We accumulate per-triangle tangents weighted by triangle area
+    // (un-normalized cross-style accumulation) and orthogonalize against the
+    // vertex normal at the end.
+    computeMeshTangents(mesh);
 
     // Compute local AABB
     if (!mesh.vertices.empty()) {
@@ -146,6 +197,7 @@ Mesh createCubeMesh() {
     mesh.aabbMin = { -0.5f, -0.5f, -0.5f };
     mesh.aabbMax = {  0.5f,  0.5f,  0.5f };
 
+    computeMeshTangents(mesh);
     return mesh;
 }
 
@@ -219,6 +271,7 @@ Mesh createIcosphereMesh(uint32_t subdivisions) {
     mesh.indices = std::move(indices);
     mesh.aabbMin = { -0.5f, -0.5f, -0.5f };
     mesh.aabbMax = {  0.5f,  0.5f,  0.5f };
+    computeMeshTangents(mesh);
     return mesh;
 }
 
@@ -245,10 +298,7 @@ void uploadMesh(Mesh& mesh, VkPhysicalDevice physicalDevice, VkDevice device,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    void* data;
-    vkMapMemory(device, staging.memory, 0, vbSize, 0, &data);
-    memcpy(data, mesh.vertices.data(), vbSize);
-    vkUnmapMemory(device, staging.memory);
+    memcpy(staging.mapped, mesh.vertices.data(), vbSize);
 
     mesh.vertexBuffer = createBuffer(physicalDevice, device, vbSize,
         vbUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -263,15 +313,24 @@ void uploadMesh(Mesh& mesh, VkPhysicalDevice physicalDevice, VkDevice device,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    vkMapMemory(device, staging.memory, 0, ibSize, 0, &data);
-    memcpy(data, mesh.indices.data(), ibSize);
-    vkUnmapMemory(device, staging.memory);
+    memcpy(staging.mapped, mesh.indices.data(), ibSize);
 
     mesh.indexBuffer = createBuffer(physicalDevice, device, ibSize,
         ibUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     copyBuffer(device, commandPool, queue, staging.buffer, mesh.indexBuffer.buffer, ibSize);
     destroyBuffer(device, staging);
+
+    // Cache buffer device addresses once. They're stable for the life of the
+    // mesh (the buffers don't get reallocated), so the per-frame TLAS gather
+    // can read them directly instead of calling vkGetBufferDeviceAddress().
+    // Only valid when RT/BDA features are enabled — otherwise the API call
+    // would itself fail. Guard with RT_SUPPORTED to match buffer-creation
+    // flags in this function.
+    if (RT_SUPPORTED) {
+        mesh.vertexAddress = getBufferDeviceAddress(device, mesh.vertexBuffer.buffer);
+        mesh.indexAddress  = getBufferDeviceAddress(device, mesh.indexBuffer.buffer);
+    }
 
     // Build per-mesh BLAS if RT is available. Falls through silently otherwise.
     if (RT_SUPPORTED) {

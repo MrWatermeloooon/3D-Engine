@@ -1,24 +1,28 @@
 #version 450
 
-// GPU-driven culling: frustum + LOD + (previous-frame) HZB occlusion.
+// GPU-driven culling: frustum + LOD + HZB occlusion, two-pass (Phase 2.2).
 //
-// Per candidate:
-//   1. Frustum-test against the current camera planes.
-//   2. Project the world-space AABB through the PREVIOUS frame's view-proj,
-//      compute screen-space rect + nearest depth, sample HZB at an
-//      appropriate mip, compare. If AABB-min-depth strictly behind the HZB
-//      max for that region → occluded.
-//   3. LOD-pick by current-frame distance.
-//   4. atomicAdd into the chosen LOD's main draw cmd; unconditionally append
-//      to the shadow draw cmd.
+// Pass 0 runs early-frame against the PREVIOUS frame's HZB. Anything passing
+// goes into the pass-0 indirect/instance slots (lodCmd[], lodBase[]) and gets
+// marked visible in `vismask[id]`.
 //
-// Occlusion correctness note: using previous-frame HZB + view-proj is the
-// "single-pass" approximation. It can briefly false-cull objects newly
-// visible after fast camera motion (popping). Acceptable for this engine.
+// After pass 0's draw lands and depth → HZB is rebuilt with the partial set,
+// pass 1 runs against the FRESH HZB but only over candidates that were culled
+// by pass 0 (vismask[id] == 0). Anything passing this time goes into the
+// pass-1 slots (lodCmdLate[], lodBaseLate[]). Newly-revealed objects that the
+// previous-frame HZB wrongly considered occluded now get drawn — the pop-in
+// that the single-pass version exhibited on fast camera motion is gone.
+//
+// Shadow draws stay in pass 0 only: no depth feedback, no benefit from a
+// second cull.
 
 layout(local_size_x = 64) in;
 
 #define MAX_LOD 4
+
+layout(push_constant) uniform Push {
+    uint pass;   // 0 = early (prev HZB), 1 = late (curr HZB, skip already-drawn)
+} pc;
 
 struct InstanceData {
     mat4 model;          // 64
@@ -26,7 +30,9 @@ struct InstanceData {
     vec4 matParams;      // 16
     vec4 normalCol0;     // 16
     vec4 normalCol1;     // 16
-    vec4 normalCol2;     // 16  → 144 bytes
+    vec4 normalCol2;     // 16
+    mat4 prevModel;      // 64
+    vec4 matParams2;     // 16  → 224 bytes (x=heightSlot, y=parallaxScale)
 };
 
 struct Candidate {
@@ -39,10 +45,12 @@ struct BatchHeader {
     uint  shadowBase;
     uint  shadowCmd;
     uint  lodCount;
-    uint  _pad0;
+    uint  shadowLodBias;
     uint  lodBase[MAX_LOD];
     uint  lodCmd[MAX_LOD];
     float lodDist[MAX_LOD];
+    uint  lodBaseLate[MAX_LOD];
+    uint  lodCmdLate[MAX_LOD];
 };
 
 struct DrawCmd {
@@ -77,6 +85,13 @@ layout(set = 0, binding = 5, std140) uniform CullParams {
     uint _pad0, _pad1, _pad2;
 } params;
 layout(set = 0, binding = 6) uniform sampler2D hzb;
+// Visibility mask: written by pass 0 (1 = passed cull, 0 = culled), read by
+// pass 1 to skip work for candidates that were already drawn. One uint per
+// candidate keeps the access pattern simple — packing into bitfields would
+// save 32× memory but cost atomic ops.
+layout(set = 0, binding = 7, std430) buffer VisMask {
+    uint vismask[];
+};
 
 bool aabbInFrustum(vec3 mn, vec3 mx) {
     for (int i = 0; i < 6; ++i) {
@@ -91,7 +106,8 @@ bool aabbInFrustum(vec3 mn, vec3 mx) {
 }
 
 uint pickLod(float distance, BatchHeader B) {
-    uint last = B.lodCount - 1u;
+    uint last = 0u;
+    if (B.lodCount > 0u) last = B.lodCount - 1u;
     for (uint i = 0u; i < B.lodCount; ++i) {
         if (distance < B.lodDist[i]) return i;
     }
@@ -114,18 +130,13 @@ bool projectAabb(vec3 mn, vec3 mx, out vec2 uvMin, out vec2 uvMax, out float dep
     vec3 hi = vec3(-1e30);
     for (int i = 0; i < 8; ++i) {
         vec4 clip = params.prevViewProj * vec4(corners[i], 1.0);
-        if (clip.w <= 0.0) return false;  // behind camera — bail conservatively
+        if (clip.w <= 0.0) return false;
         vec3 ndc = clip.xyz / clip.w;
-        // Vulkan NDC: x,y ∈ [-1,1], z ∈ [0,1]
         vec3 uvz = vec3(ndc.xy * 0.5 + 0.5, ndc.z);
         lo = min(lo, uvz);
         hi = max(hi, uvz);
     }
 
-    // Reject AABBs that fall fully outside the screen — they're past the
-    // frustum check from prev frame's perspective, which doesn't help us
-    // here. Don't bother HZB-testing; just say "visible" (frustum culling
-    // already filtered current frame).
     if (hi.x < 0.0 || hi.y < 0.0 || lo.x > 1.0 || lo.y > 1.0) return false;
 
     uvMin    = clamp(lo.xy, vec2(0.0), vec2(1.0));
@@ -137,21 +148,18 @@ bool projectAabb(vec3 mn, vec3 mx, out vec2 uvMin, out vec2 uvMax, out float dep
 // Conservative HZB occlusion test. Picks the smallest mip whose texel
 // covers the projected AABB and reads the max depth there.
 bool isOccluded(vec3 mn, vec3 mx) {
-    if (params.hzbSizeMipCount.w < 0.5) return false; // occlusion disabled
+    if (params.hzbSizeMipCount.w <= 0.0) return false;
 
     vec2  uvMin; vec2 uvMax; float depthMin;
     if (!projectAabb(mn, mx, uvMin, uvMax, depthMin)) return false;
 
-    vec2 hzbSize = params.hzbSizeMipCount.xy;
+    vec2 hzbSize  = params.hzbSizeMipCount.xy;
     int  mipCount = int(params.hzbSizeMipCount.z);
 
-    // Choose a mip such that one HZB texel at that mip covers the projected
-    // rect. Width-in-texels at mip 0 = (uvMax-uvMin) * hzbSize.
     vec2  rectPx = (uvMax - uvMin) * hzbSize;
     float maxDim = max(rectPx.x, rectPx.y);
     int   mip    = clamp(int(ceil(log2(max(maxDim, 1.0)))), 0, mipCount - 1);
 
-    // Sample 2×2 at chosen mip around the rect (more conservative).
     vec2 mipTexel = 1.0 / max(vec2(1.0), floor(hzbSize / float(1 << mip)));
     vec2 uvCenter = (uvMin + uvMax) * 0.5;
     float d00 = textureLod(hzb, uvCenter + mipTexel * vec2(-0.5, -0.5), float(mip)).r;
@@ -160,7 +168,6 @@ bool isOccluded(vec3 mn, vec3 mx) {
     float d11 = textureLod(hzb, uvCenter + mipTexel * vec2( 0.5,  0.5), float(mip)).r;
     float hzbDepth = max(max(d00, d10), max(d01, d11));
 
-    // AABB closest (min depth) STRICTLY > HZB max → fully behind → occluded.
     return depthMin > hzbDepth;
 }
 
@@ -168,22 +175,46 @@ void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= params.numCandidates) return;
 
+    // ── Pass 1 fast-out: already drawn by pass 0 ──────────────────────────
+    if (pc.pass == 1u && vismask[id] == 1u) return;
+
     Candidate c   = cand[id];
     uint batchIdx = floatBitsToUint(c.aabbMin.w);
+    if (batchIdx >= batches.length()) {
+        if (pc.pass == 0u) vismask[id] = 0u;  // explicit miss
+        return;
+    }
     BatchHeader B = batches[batchIdx];
 
-    // Shadow: unconditional (LOD0 mesh). No frustum / occlusion cull.
-    uint shadowSlot = atomicAdd(cmds[B.shadowCmd].instanceCount, 1u);
-    shadowInst[B.shadowBase + shadowSlot] = c.data;
+    // Shadow: pass 0 only, unconditional (LOD0 mesh). No frustum / occlusion.
+    if (pc.pass == 0u) {
+        uint shadowSlot = atomicAdd(cmds[B.shadowCmd].instanceCount, 1u);
+        shadowInst[B.shadowBase + shadowSlot] = c.data;
+    }
 
     // Main: frustum, then occlusion, then LOD pick.
-    if (!aabbInFrustum(c.aabbMin.xyz, c.aabbMax.xyz)) return;
-    if (isOccluded(c.aabbMin.xyz, c.aabbMax.xyz))     return;
+    if (!aabbInFrustum(c.aabbMin.xyz, c.aabbMax.xyz)) {
+        if (pc.pass == 0u) vismask[id] = 0u;
+        return;
+    }
+    if (isOccluded(c.aabbMin.xyz, c.aabbMax.xyz)) {
+        if (pc.pass == 0u) vismask[id] = 0u;
+        return;
+    }
 
     vec3 center = 0.5 * (c.aabbMin.xyz + c.aabbMax.xyz);
     float dist  = length(params.cameraPos.xyz - center);
     uint  lod   = pickLod(dist, B);
 
-    uint mainSlot = atomicAdd(cmds[B.lodCmd[lod]].instanceCount, 1u);
-    mainInst[B.lodBase[lod] + mainSlot] = c.data;
+    if (pc.pass == 0u) {
+        uint mainSlot = atomicAdd(cmds[B.lodCmd[lod]].instanceCount, 1u);
+        mainInst[B.lodBase[lod] + mainSlot] = c.data;
+        vismask[id] = 1u;
+    } else {
+        // Pass 1 — vismask was 0, this candidate was newly revealed by the
+        // fresh HZB. Append to the late slots.
+        uint mainSlot = atomicAdd(cmds[B.lodCmdLate[lod]].instanceCount, 1u);
+        mainInst[B.lodBaseLate[lod] + mainSlot] = c.data;
+        // Don't write vismask here; pass 0 of NEXT frame doesn't read it.
+    }
 }

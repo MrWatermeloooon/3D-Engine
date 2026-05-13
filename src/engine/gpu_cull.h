@@ -31,6 +31,12 @@ struct GpuCullData {
     // Per-frame params UBO. Lives here so the cull module owns its own data.
     std::vector<AllocatedBuffer> paramsBuffers;
     std::vector<void*>           paramsMapped;
+
+    // Per-frame visibility mask: uint per candidate, written by pass 0 of
+    // cull.comp and read by pass 1. Sized to MAX_INSTANCES_PER_FRAME so the
+    // worst-case scene fits without a resize.
+    std::vector<AllocatedBuffer> visMaskBuffers;
+    uint32_t                     visMaskCapacity = 0;
 };
 
 // CullParamsUBO — must match cull.comp's CullParams layout (std140).
@@ -49,7 +55,8 @@ void createGpuCull(GpuCullData& cull, VkPhysicalDevice physicalDevice, VkDevice 
 
 // Bind buffers (SSBOs) and the HZB sampler to each per-frame descriptor set.
 // Called once at init, and again on swapchain rebuild because the HZB image
-// (and possibly buffer identities) change.
+// (and possibly buffer identities) change. The vismask buffers are created
+// alongside the cull pipeline and bound here too.
 void writeGpuCullDescriptors(GpuCullData& cull, VkDevice device,
                              const CandidateBuffer&   candidates,
                              const BatchHeaderBuffer& batches,
@@ -60,7 +67,10 @@ void writeGpuCullDescriptors(GpuCullData& cull, VkDevice device,
                              VkSampler                hzbSampler);
 
 // Upload CullParamsUBO for this frame, then dispatch.
+//   pass = 0 → early cull against the previous-frame HZB
+//   pass = 1 → late cull against the freshly-rebuilt current-frame HZB,
+//              skipping candidates that already passed pass 0
 void dispatchCull(VkCommandBuffer cmd, GpuCullData& cull, uint32_t frame,
-                  const CullParamsUBO& params);
+                  const CullParamsUBO& params, uint32_t pass);
 
 void destroyGpuCull(VkDevice device, GpuCullData& cull);

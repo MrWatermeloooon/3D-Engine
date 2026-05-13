@@ -1,8 +1,11 @@
 #include "engine.h"
 #include "frustum.h"
+#include "gltf_loader.h"
 
 #include <imgui.h>
 
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -13,7 +16,7 @@
 // ── Init ────────────────────────────────────────────────────────────────────
 
 void Engine::init() {
-    m_window = new Window(1280, 720, "VulkanEngine");
+    m_window = std::make_unique<Window>(1280, 720, "VulkanEngine");
 
     auto extensions = m_window->getRequiredExtensions();
 
@@ -26,6 +29,10 @@ void Engine::init() {
     m_vk.device         = createLogicalDevice(m_vk.physicalDevice, m_vk.queueFamilies, {});
     vkGetDeviceQueue(m_vk.device, m_vk.queueFamilies.graphicsFamily.value(), 0, &m_vk.graphicsQueue);
     vkGetDeviceQueue(m_vk.device, m_vk.queueFamilies.presentFamily.value(),  0, &m_vk.presentQueue);
+
+    // VMA allocator. Must be ready before any buffer/image is created, but
+    // after the logical device since VMA caches device-level function pointers.
+    createVmaAllocator(m_vk.instance, m_vk.physicalDevice, m_vk.device);
 
     createCommandPool(m_renderer, m_vk.device, m_vk.queueFamilies.graphicsFamily.value());
 
@@ -67,22 +74,22 @@ void Engine::init() {
     // Light buffers
     createLightBuffers(m_lightBuffers, m_vk.physicalDevice, m_vk.device, MAX_FRAMES_IN_FLIGHT);
 
-    // GPU-driven culling buffers. Main-instance capacity grew because each
-    // batch over-reserves lodCount × instanceCount slots (worst case all
-    // instances pick the same LOD). Indirect grew because each batch now
-    // owns lodCount + 1 cmds (per-LOD main + 1 shadow).
-    constexpr uint32_t MAX_INSTANCES_PER_FRAME = 16384;
-    constexpr uint32_t MAX_BATCHES_PER_FRAME   = 1024;
+    // GPU-driven culling buffers. Phase 2.2 (two-pass occlusion) doubles the
+    // per-LOD reservations: each batch has separate pass-0 and pass-1 ranges
+    // in the main instance buffer, and 2*lodCount + 1 indirect cmds (pass-0
+    // + pass-1 main + shadow).
+    using engine_config::MAX_INSTANCES_PER_FRAME;
+    using engine_config::MAX_BATCHES_PER_FRAME;
     createCandidateBuffer(m_candidates, m_vk.physicalDevice, m_vk.device,
                           MAX_FRAMES_IN_FLIGHT, MAX_INSTANCES_PER_FRAME);
     createBatchHeaderBuffer(m_batchHeaders, m_vk.physicalDevice, m_vk.device,
                             MAX_FRAMES_IN_FLIGHT, MAX_BATCHES_PER_FRAME);
     createInstanceBuffer(m_mainInstances,   m_vk.physicalDevice, m_vk.device,
-                         MAX_FRAMES_IN_FLIGHT, MAX_INSTANCES_PER_FRAME * MAX_LOD);
+                         MAX_FRAMES_IN_FLIGHT, MAX_INSTANCES_PER_FRAME * MAX_LOD * 2);
     createInstanceBuffer(m_shadowInstances, m_vk.physicalDevice, m_vk.device,
                          MAX_FRAMES_IN_FLIGHT, MAX_INSTANCES_PER_FRAME);
     createIndirectBuffer(m_indirect, m_vk.physicalDevice, m_vk.device,
-                         MAX_FRAMES_IN_FLIGHT, MAX_BATCHES_PER_FRAME * (MAX_LOD + 1));
+                         MAX_FRAMES_IN_FLIGHT, MAX_BATCHES_PER_FRAME * (2 * MAX_LOD + 1));
 
     // Compute-cull pipeline + per-frame UBO. Pointed at buffers after HZB is
     // built (cull descriptor set includes the HZB sampler binding).
@@ -134,6 +141,20 @@ void Engine::init() {
                               m_shadow.arrayView, m_shadow.sampler);
     allocateBindlessTexturesSet(m_descriptors, m_vk.device);
 
+    // ── IBL probes ────────────────────────────────────────────────────────
+    // Create the env / irradiance / prefilter / BRDF-LUT resources, bake them
+    // from the procedural sky, then point all per-frame scene sets at them.
+    // bakeIbl re-runs cheaply later if the user picks a different HDR.
+    createIbl(m_ibl, m_vk.physicalDevice, m_vk.device);
+    bakeIbl(m_ibl, m_vk.physicalDevice, m_vk.device,
+            m_renderer.commandPool, m_vk.graphicsQueue, m_iblParams);
+    for (uint32_t f = 0; f < MAX_FRAMES_IN_FLIGHT; ++f) {
+        writeSceneIbl(m_descriptors, m_vk.device, f,
+                      m_ibl.irradianceView, m_ibl.prefilterView, m_ibl.brdfLutView,
+                      m_ibl.cubeSampler, m_ibl.lutSampler);
+    }
+    m_iblRebuildRequested = false;
+
     // Resource manager (default mesh + texture)
     m_resources.init(m_vk.physicalDevice, m_vk.device,
                      m_renderer.commandPool, m_vk.graphicsQueue, m_descriptors);
@@ -143,6 +164,12 @@ void Engine::init() {
                                         m_offscreen.extent,
                                         m_descriptors.sceneSetLayout, m_descriptors.materialSetLayout,
                                         "shaders/mesh.vert.spv", "shaders/mesh.frag.spv");
+
+    // Sky pipeline — shares the offscreen render pass; drawn after geometry
+    // inside the same pass.
+    createSkyPipeline(m_sky, m_vk.device, m_offscreen.renderPass, m_offscreen.extent,
+                      m_descriptors.sceneSetLayout,
+                      "shaders/sky.vert.spv", "shaders/sky.frag.spv");
 
     // Shadow pipeline
     m_shadowPipeline = createShadowPipeline(m_vk.device, m_shadow.renderPass,
@@ -174,8 +201,7 @@ void Engine::init() {
         m_boneUbos[i] = createBuffer(m_vk.physicalDevice, m_vk.device, sizeof(BonePalette),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkMapMemory(m_vk.device, m_boneUbos[i].memory, 0, sizeof(BonePalette), 0,
-                    &m_boneMapped[i]);
+        m_boneMapped[i] = m_boneUbos[i].mapped;
     }
     {
         std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, m_boneSetLayout);
@@ -204,6 +230,12 @@ void Engine::init() {
         m_descriptors.sceneSetLayout, m_descriptors.materialSetLayout, m_boneSetLayout,
         "shaders/mesh_skinned.vert.spv", "shaders/mesh.frag.spv");
 
+    // Skinned shadow pipeline — same shadow render pass as the static
+    // shadow pipeline; bone palette set + (lightVP, model) push constants.
+    m_skinnedShadowPipeline = createSkinnedShadowPipeline(m_vk.device,
+        m_shadow.renderPass, SHADOW_MAP_SIZE, m_boneSetLayout,
+        "shaders/shadow_skinned.vert.spv");
+
     // Post-FX pipelines + descriptor sets
     createPostFXPipelines(m_postFX, m_vk.device, m_bloom, m_ssao, m_composite, m_ldr,
                           m_offscreen, m_swapchain.renderPass, MAX_FRAMES_IN_FLIGHT);
@@ -219,6 +251,10 @@ void Engine::init() {
                    m_vk.device, m_vk.queueFamilies.graphicsFamily.value(),
                    m_vk.graphicsQueue, m_swapchain.renderPass,
                    static_cast<uint32_t>(m_swapchain.images.size()));
+
+    // Profiler: GPU timestamps + CPU scopes. Independent of any GPU work; safe
+    // to init last. Per-frame query pools sized for MAX_FRAMES_IN_FLIGHT.
+    m_profiler.init(m_vk.device, m_vk.physicalDevice, MAX_FRAMES_IN_FLIGHT);
 
     m_lastFrameTime = glfwGetTime();
     std::cout << "[VulkanEngine] Initialization complete\n";
@@ -293,27 +329,85 @@ void Engine::run() {
         float  dt          = static_cast<float>(dt64);
 
         processInput(dt64);
-        m_scene.update(dt);
+        {
+            PROFILE_CPU(m_profiler, "scene update");
+            m_scene.update(dt);
+        }
 
         m_hotReloadTimer += dt;
-        if (m_hotReloadTimer >= 2.0f) { m_resources.pollHotReload(); m_hotReloadTimer = 0.0f; }
+        // Subtract the interval instead of zeroing — zeroing accumulates
+        // float drift over many frames and can skip a cycle.
+        if (m_hotReloadTimer >= 2.0f) { m_resources.pollHotReload(); m_hotReloadTimer -= 2.0f; }
 
         m_debugUI.beginFrame();
         m_debugUI.buildUI(m_scene.registry(), m_resources, m_camera, m_shadow,
                           m_postFXSettings, m_rtSettings,
                           m_visibleEntities, m_totalEntities,
-                          dt);
+                          dt, &m_profiler, &m_skinnedMesh,
+                          &m_iblParams, &m_iblRebuildRequested,
+                          &m_pendingGltfLoad);
+
+        if (!m_pendingGltfLoad.empty()) {
+            vkDeviceWaitIdle(m_vk.device);
+            SkinnedMesh fresh{};
+            std::string err;
+            if (loadGltfSkinned(m_pendingGltfLoad, fresh, &err)) {
+                destroySkinnedMesh(m_vk.device, m_skinnedMesh);
+                m_skinnedMesh = std::move(fresh);
+                uploadSkinnedMesh(m_skinnedMesh, m_vk.physicalDevice, m_vk.device,
+                                  m_renderer.commandPool, m_vk.graphicsQueue);
+                std::cout << "[glTF] Loaded skinned mesh from " << m_pendingGltfLoad
+                          << " — " << m_skinnedMesh.vertices.size() << " verts, "
+                          << m_skinnedMesh.skeleton.joints.size() << " joints, "
+                          << m_skinnedMesh.animations.size() << " anims.\n";
+                // Reset all animators so they replay the new clip from t=0
+                // rather than pointing at a clip index that no longer exists
+                // or running at a time past the new clip's duration.
+                auto av = m_scene.registry().view<AnimatorComponent>();
+                for (auto e : av) {
+                    auto& a = av.get<AnimatorComponent>(e);
+                    a.animationIndex = 0;
+                    a.time = 0.0f;
+                }
+            } else {
+                std::cerr << "[glTF] Load failed: " << err << "\n";
+            }
+            m_pendingGltfLoad.clear();
+        }
+
+        // Honor an IBL rebuild request from the UI before recording the
+        // frame. vkDeviceWaitIdle keeps it safe — the rebake re-records on
+        // a single-time command buffer and re-writes the per-frame scene
+        // descriptors. Infrequent: only when the user pushes Rebake.
+        if (m_iblRebuildRequested) {
+            vkDeviceWaitIdle(m_vk.device);
+            bakeIbl(m_ibl, m_vk.physicalDevice, m_vk.device,
+                    m_renderer.commandPool, m_vk.graphicsQueue, m_iblParams);
+            for (uint32_t f = 0; f < MAX_FRAMES_IN_FLIGHT; ++f) {
+                writeSceneIbl(m_descriptors, m_vk.device, f,
+                              m_ibl.irradianceView, m_ibl.prefilterView, m_ibl.brdfLutView,
+                              m_ibl.cubeSampler, m_ibl.lutSampler);
+            }
+            m_iblRebuildRequested = false;
+        }
         m_debugUI.endFrame();
 
         uint32_t frame = m_renderer.currentFrame;
 
-        glm::vec3 dirLightDir = updateLightBuffer(m_lightBuffers, frame, m_scene.registry());
+        glm::vec3 dirLightDir;
+        {
+            PROFILE_CPU(m_profiler, "updateLightBuffer");
+            dirLightDir = updateLightBuffer(m_lightBuffers, frame, m_scene.registry());
+        }
 
         CascadeUBO cascadeUbo{};
-        computeCascades(m_shadow, frame,
-                        m_camera.getViewMatrix(), m_camera.getProjectionMatrix(),
-                        m_camera.nearClip(), m_camera.farClip(),
-                        dirLightDir, cascadeUbo);
+        {
+            PROFILE_CPU(m_profiler, "computeCascades");
+            computeCascades(m_shadow, frame,
+                            m_camera.getViewMatrix(), m_camera.getProjectionMatrix(),
+                            m_camera.nearClip(), m_camera.farClip(),
+                            dirLightDir, cascadeUbo);
+        }
 
         UniformBufferObject ubo{};
         ubo.view      = m_camera.getViewMatrix();
@@ -338,6 +432,10 @@ void Engine::run() {
             auto dirView = m_scene.registry().view<DirectionalLightComponent>();
             anyDirectional = dirView.begin() != dirView.end();
         }
+        // sunOnly only applies when there IS a directional light. With no
+        // directional in the scene, the shader's "shadow only the first
+        // directional" branch would skip every light's shadow ray and the
+        // scene would render unshadowed — fall through to per-light RT instead.
         const bool effectiveSunOnly = m_rtSettings.sunOnly && anyDirectional;
         // x=enabled, y=softness, z=samples, w=sunOnly flag
         ubo.rtParams  = glm::vec4(rtShadowsActive ? 1.0f : 0.0f,
@@ -366,6 +464,10 @@ void Engine::run() {
         // RT is off.
         PostFXSettings effectiveFx = m_postFXSettings;
         if (rtShadowsActive) effectiveFx.ssaoEnabled = false;
+        // DoF depth-linearisation needs the camera's near/far each frame —
+        // the camera owns the canonical values, so plumb them through.
+        effectiveFx.nearClip = m_camera.nearClip();
+        effectiveFx.farClip  = m_camera.farClip();
 
         glm::mat4 proj    = m_camera.getProjectionMatrix();
         glm::mat4 invProj = glm::inverse(proj);
@@ -378,10 +480,28 @@ void Engine::run() {
         auto animView = m_scene.registry().view<AnimatorComponent>();
         for (auto e : animView) {
             auto& a = animView.get<AnimatorComponent>(e);
-            if (a.playing) a.time += dt * a.speed;
             if (!m_skinnedMesh.animations.empty()) {
-                int ai = std::min(a.animationIndex,
-                                  static_cast<int>(m_skinnedMesh.animations.size()) - 1);
+                // Clamp on BOTH ends — a negative animationIndex slips past
+                // std::min unchecked and indexes the array out of bounds.
+                int ai = std::clamp(a.animationIndex, 0,
+                                    static_cast<int>(m_skinnedMesh.animations.size()) - 1);
+                const float dur = m_skinnedMesh.animations[ai].duration;
+                if (a.playing) {
+                    a.time += dt * a.speed;
+                    if (dur > 0.0f) {
+                        if (a.loop) {
+                            // fmod can return negative for reversed playback; rebias to [0, dur).
+                            a.time = std::fmod(a.time, dur);
+                            if (a.time < 0.0f) a.time += dur;
+                        } else if (a.time >= dur) {
+                            a.time   = dur;
+                            a.playing = false;
+                        } else if (a.time < 0.0f) {
+                            a.time   = 0.0f;
+                            a.playing = false;
+                        }
+                    }
+                }
                 computeBoneMatrices(m_skinnedMesh.skeleton,
                                     m_skinnedMesh.animations[ai], a.time, palette);
                 anySkinned = true;
@@ -434,19 +554,28 @@ void Engine::run() {
         info.rtSettings      = &m_rtSettings;
         info.physicalDevice  = m_vk.physicalDevice;
         info.skinnedMesh     = &m_skinnedMesh;
-        info.skinnedPipeline = m_skinnedPipeline.graphicsPipeline;
-        info.skinnedLayout   = m_skinnedPipeline.pipelineLayout;
+        info.skinnedPipeline       = m_skinnedPipeline.graphicsPipeline;
+        info.skinnedLayout         = m_skinnedPipeline.pipelineLayout;
+        info.skinnedShadowPipeline = m_skinnedShadowPipeline.graphicsPipeline;
+        info.skinnedShadowLayout   = m_skinnedShadowPipeline.pipelineLayout;
+        info.sky                   = &m_sky;
         info.boneDescriptorSet = m_boneDescSets[frame];
         info.jobSystem       = &m_jobs;
         info.visibleEntities = &m_visibleEntities;
         info.totalEntities   = &m_totalEntities;
         info.registry        = &m_scene.registry();
         info.resources       = &m_resources;
+        info.prevTransforms  = &m_prevTransforms;
+        info.profiler        = &m_profiler;
 
         bool needsRecreation = drawFrame(m_renderer, m_swapchain, m_vk.device,
                                           m_vk.graphicsQueue, m_vk.presentQueue,
                                           info, m_window->framebufferResized);
         if (needsRecreation) {
+            // The projection (and HZB extent) is about to change — invalidate
+            // the prev-frame view-proj so the next frame doesn't reproject
+            // AABBs into an HZB built at a different resolution.
+            m_hasPrevVP = false;
             recreateSwapchain();
         } else {
             // Save this frame's view-proj so the next frame's compute cull can
@@ -486,6 +615,7 @@ void Engine::recreateSwapchain() {
     destroyCompositeData(m_vk.device, m_composite);
     vkDestroyPipeline(m_vk.device, m_pipeline.graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(m_vk.device, m_pipeline.pipelineLayout, nullptr);
+    destroySkyPipeline(m_vk.device, m_sky);
 
     // Recreate swapchain (color-only)
     createSwapchain(m_swapchain, m_vk.physicalDevice, m_vk.device, m_vk.surface,
@@ -530,6 +660,9 @@ void Engine::recreateSwapchain() {
                                         m_offscreen.extent,
                                         m_descriptors.sceneSetLayout, m_descriptors.materialSetLayout,
                                         "shaders/mesh.vert.spv", "shaders/mesh.frag.spv");
+    createSkyPipeline(m_sky, m_vk.device, m_offscreen.renderPass, m_offscreen.extent,
+                      m_descriptors.sceneSetLayout,
+                      "shaders/sky.vert.spv", "shaders/sky.frag.spv");
 
     // Recreate post-FX pipelines + descriptor sets
     createPostFXPipelines(m_postFX, m_vk.device, m_bloom, m_ssao, m_composite, m_ldr,
@@ -544,6 +677,7 @@ void Engine::recreateSwapchain() {
 void Engine::cleanup() {
     if (m_vk.device != VK_NULL_HANDLE) vkDeviceWaitIdle(m_vk.device);
 
+    m_profiler.shutdown(m_vk.device);
     m_debugUI.cleanup(m_vk.device);
 
     destroyPostFXPipelines(m_vk.device, m_postFX);
@@ -575,6 +709,10 @@ void Engine::cleanup() {
         vkDestroyPipeline(m_vk.device, m_skinnedPipeline.graphicsPipeline, nullptr);
     if (m_skinnedPipeline.pipelineLayout)
         vkDestroyPipelineLayout(m_vk.device, m_skinnedPipeline.pipelineLayout, nullptr);
+    if (m_skinnedShadowPipeline.graphicsPipeline)
+        vkDestroyPipeline(m_vk.device, m_skinnedShadowPipeline.graphicsPipeline, nullptr);
+    if (m_skinnedShadowPipeline.pipelineLayout)
+        vkDestroyPipelineLayout(m_vk.device, m_skinnedShadowPipeline.pipelineLayout, nullptr);
     destroySkinnedMesh(m_vk.device, m_skinnedMesh);
 
     m_resources.cleanup();
@@ -585,6 +723,8 @@ void Engine::cleanup() {
     vkDestroyPipelineLayout(m_vk.device, m_shadowPipeline.pipelineLayout, nullptr);
     vkDestroyPipeline(m_vk.device, m_pipeline.graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(m_vk.device, m_pipeline.pipelineLayout, nullptr);
+    destroySkyPipeline(m_vk.device, m_sky);
+    destroyIbl(m_vk.device, m_ibl);
 
     vkDestroyDescriptorSetLayout(m_vk.device, m_descriptors.materialSetLayout, nullptr);
     vkDestroyDescriptorSetLayout(m_vk.device, m_descriptors.sceneSetLayout, nullptr);
@@ -600,12 +740,15 @@ void Engine::cleanup() {
     for (auto iv : m_swapchain.imageViews) vkDestroyImageView(m_vk.device, iv, nullptr);
     vkDestroySwapchainKHR(m_vk.device, m_swapchain.swapchain, nullptr);
 
+    // VMA allocator owns sub-allocations against the device — release before
+    // the device handle goes away.
+    destroyVmaAllocator();
+
     vkDestroyDevice(m_vk.device, nullptr);
     vkDestroySurfaceKHR(m_vk.instance, m_vk.surface, nullptr);
     destroyDebugMessenger(m_vk.instance, m_vk.debugMessenger);
     vkDestroyInstance(m_vk.instance, nullptr);
 
-    delete m_window;
-    m_window = nullptr;
+    m_window.reset();
     std::cout << "[VulkanEngine] Cleanup complete\n";
 }

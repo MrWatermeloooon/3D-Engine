@@ -15,6 +15,7 @@
       "name": "release",
       "displayName": "Release (vcpkg)",
       "inherits": "default",
+      "binaryDir": "${sourceDir}/build-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }

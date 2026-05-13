@@ -16,7 +16,7 @@ void createLightBuffers(LightBufferData& data, VkPhysicalDevice physicalDevice,
         data.buffers[i] = createBuffer(physicalDevice, device, size,
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkMapMemory(device, data.buffers[i].memory, 0, size, 0, &data.mapped[i]);
+        data.mapped[i] = data.buffers[i].mapped;
     }
 }
 

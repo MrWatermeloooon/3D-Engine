@@ -7,11 +7,16 @@
 
 #include <entt/entt.hpp>
 
+#include <string>
+
 class Camera;
 class ResourceManager;
+class Profiler;
 struct ShadowData;
 struct PostFXSettings;
 struct RtSettings;
+struct SkinnedMesh;
+struct IblBakeParams;
 
 class DebugUI {
 public:
@@ -26,7 +31,12 @@ public:
                  Camera& camera, ShadowData& shadow, PostFXSettings& postfx,
                  RtSettings& rt,
                  int visibleEntities, int totalEntities,
-                 float deltaTime);
+                 float deltaTime,
+                 const Profiler* profiler = nullptr,
+                 const SkinnedMesh* skinnedMesh = nullptr,
+                 IblBakeParams* iblParams = nullptr,
+                 bool* iblRebuildRequest = nullptr,
+                 std::string* pendingGltfLoad = nullptr);
     void endFrame();
 
 private:
@@ -44,4 +54,8 @@ private:
     int  m_gizmoOperation = 7;     // ImGuizmo::TRANSLATE = 7
     int  m_gizmoMode      = 1;     // ImGuizmo::WORLD = 1
     bool m_initialDockBuilt = false;
+
+    // Animator scrubber: remembers whether playback was active when the slider
+    // was grabbed, so releasing the slider restores that state.
+    bool m_animScrubWasPlaying = false;
 };

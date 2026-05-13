@@ -1,6 +1,7 @@
 #include "postfx.h"
 #include "depth.h"
 #include "pipeline.h"
+#include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
 #include <glm/glm.hpp>
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 // ──────────────────────────────────────────────────────────────────────────
 // Generic helpers
@@ -169,13 +171,21 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
     sub.pColorAttachments       = colorRefs;
     sub.pDepthStencilAttachment = &depthRef;
 
+    // Subpass dependencies. Render-pass compatibility (VUID 00904) requires
+    // these to be IDENTICAL across the early and late offscreen passes since
+    // both use the same framebuffer. Use the broader form that covers both
+    // scenarios: the late renderpass starts after HZB-reduce + cull pass 1
+    // (COMPUTE_SHADER reads/writes), the early renderpass after SSAO sampling
+    // (FRAGMENT_SHADER reads). The OR covers both at minor overhead.
     VkSubpassDependency deps[2]{};
     deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
     deps[0].dstSubpass    = 0;
-    deps[0].srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[0].srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                          | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
                           | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT
+                          | VK_ACCESS_SHADER_WRITE_BIT;
     deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
                           | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
@@ -183,7 +193,8 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
     deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
     deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
                           | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    deps[1].dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[1].dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                          | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
                           | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -198,10 +209,37 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
     rp.pDependencies   = deps;
     VK_CHECK(vkCreateRenderPass(device, &rp, nullptr, &t.renderPass));
 
+    // ── Late renderpass (Phase 2.2 two-pass occlusion) ────────────────────
+    // Same attachment formats and framebuffer, but LOAD_OP_LOAD on all three
+    // attachments and initial layouts that match where the previous use left
+    // them (color/motion: SHADER_READ_ONLY after pass A; depth: DEPTH READ_ONLY
+    // after pass A → HZB reduce). Final layouts identical to pass A so SSAO /
+    // composite see the same view.
+    VkAttachmentDescription attsLate[3] = { atts[0], atts[1], atts[2] };
+    attsLate[0].loadOp        = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attsLate[0].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    attsLate[1].loadOp        = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attsLate[1].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    attsLate[2].loadOp        = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attsLate[2].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+    // Same subpass dependencies as the early pass — required for framebuffer
+    // compatibility. The dst-side waits for HZB-reduce / pass-1 cull writes
+    // via the COMPUTE_SHADER stage included in deps[0].srcStageMask above.
+    VkRenderPassCreateInfo rpLate{};
+    rpLate.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpLate.attachmentCount = 3;
+    rpLate.pAttachments    = attsLate;
+    rpLate.subpassCount    = 1;
+    rpLate.pSubpasses      = &sub;
+    rpLate.dependencyCount = 2;
+    rpLate.pDependencies   = deps;
+    VK_CHECK(vkCreateRenderPass(device, &rpLate, nullptr, &t.renderPassLate));
+
     VkImageView attsView[] = { t.colorView, t.motionView, t.depthView };
     VkFramebufferCreateInfo fb{};
     fb.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    fb.renderPass      = t.renderPass;
+    fb.renderPass      = t.renderPass;   // framebuffer is compatible with both passes
     fb.attachmentCount = 3;
     fb.pAttachments    = attsView;
     fb.width           = extent.width;
@@ -214,25 +252,17 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
 }
 
 void destroyOffscreenTarget(VkDevice device, OffscreenTarget& t) {
-    if (t.depthSampler) vkDestroySampler(device, t.depthSampler, nullptr);
-    if (t.sampler)      vkDestroySampler(device, t.sampler, nullptr);
-    if (t.framebuffer)  vkDestroyFramebuffer(device, t.framebuffer, nullptr);
-    if (t.renderPass)   vkDestroyRenderPass(device, t.renderPass, nullptr);
-    if (t.colorView)    vkDestroyImageView(device, t.colorView, nullptr);
+    if (t.depthSampler)   vkDestroySampler(device, t.depthSampler, nullptr);
+    if (t.sampler)        vkDestroySampler(device, t.sampler, nullptr);
+    if (t.framebuffer)    vkDestroyFramebuffer(device, t.framebuffer, nullptr);
+    if (t.renderPassLate) vkDestroyRenderPass(device, t.renderPassLate, nullptr);
+    if (t.renderPass)     vkDestroyRenderPass(device, t.renderPass, nullptr);
+    if (t.colorView)      vkDestroyImageView(device, t.colorView, nullptr);
     if (t.motionView)   vkDestroyImageView(device, t.motionView, nullptr);
     if (t.depthView)    vkDestroyImageView(device, t.depthView, nullptr);
-    if (t.colorImage.image) {
-        vkDestroyImage(device, t.colorImage.image, nullptr);
-        vkFreeMemory(device, t.colorImage.memory, nullptr);
-    }
-    if (t.motionImage.image) {
-        vkDestroyImage(device, t.motionImage.image, nullptr);
-        vkFreeMemory(device, t.motionImage.memory, nullptr);
-    }
-    if (t.depthImage.image) {
-        vkDestroyImage(device, t.depthImage.image, nullptr);
-        vkFreeMemory(device, t.depthImage.memory, nullptr);
-    }
+    destroyImage(device, t.colorImage);
+    destroyImage(device, t.motionImage);
+    destroyImage(device, t.depthImage);
     t = {};
 }
 
@@ -245,6 +275,22 @@ void createBloomChain(BloomChain& b, VkPhysicalDevice physicalDevice, VkDevice d
 {
     constexpr VkFormat fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
 
+    // Ensure the requested swapchain resolution can actually back BLOOM_MIP_COUNT
+    // mips. mip 0 lives at half the main extent; each subsequent mip halves
+    // again. A 16-tall window can only host 4 mips (8,4,2,1); 8-tall would
+    // collapse to a single-pixel mip 2 and out-of-bounds image-view creation.
+    {
+        uint32_t maxDim = std::max(mainExtent.width, mainExtent.height) / 2u;
+        uint32_t available = 1;
+        while ((maxDim >> available) > 0u) ++available;
+        if (available < BLOOM_MIP_COUNT) {
+            throw std::runtime_error(
+                "createBloomChain: swapchain too small for BLOOM_MIP_COUNT="
+                + std::to_string(BLOOM_MIP_COUNT)
+                + " mips (max possible = " + std::to_string(available) + ")");
+        }
+    }
+
     // mip 0 is half resolution of mainExtent
     uint32_t w = std::max(1u, mainExtent.width  / 2);
     uint32_t h = std::max(1u, mainExtent.height / 2);
@@ -254,7 +300,8 @@ void createBloomChain(BloomChain& b, VkPhysicalDevice physicalDevice, VkDevice d
         h = std::max(1u, h / 2);
     }
 
-    // Single image with N mips
+    // Single image with N mips. VMA via vmaCreateImage so the mipped image
+    // sub-allocates from the pool rather than burning a dedicated allocation.
     VkImageCreateInfo info{};
     info.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     info.imageType     = VK_IMAGE_TYPE_2D;
@@ -267,17 +314,11 @@ void createBloomChain(BloomChain& b, VkPhysicalDevice physicalDevice, VkDevice d
     info.usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(device, &info, nullptr, &b.image.image));
-
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(device, b.image.image, &req);
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize  = req.size;
-    alloc.memoryTypeIndex = findMemoryType(physicalDevice, req.memoryTypeBits,
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(device, &alloc, nullptr, &b.image.memory));
-    VK_CHECK(vkBindImageMemory(device, b.image.image, b.image.memory, 0));
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VK_CHECK(vmaCreateImage(gVmaAllocator, &info, &aci,
+                            &b.image.image, &b.image.allocation, nullptr));
+    (void)physicalDevice;
 
     // Per-mip views
     for (uint32_t i = 0; i < BLOOM_MIP_COUNT; ++i) {
@@ -322,8 +363,7 @@ void destroyBloomChain(VkDevice device, BloomChain& b) {
     if (b.upsamplePass)   vkDestroyRenderPass(device, b.upsamplePass, nullptr);
     if (b.downsamplePass) vkDestroyRenderPass(device, b.downsamplePass, nullptr);
     for (auto v : b.mipViews) if (v) vkDestroyImageView(device, v, nullptr);
-    if (b.image.image)  vkDestroyImage(device, b.image.image, nullptr);
-    if (b.image.memory) vkFreeMemory(device, b.image.memory, nullptr);
+    destroyImage(device, b.image);
     b = {};
 }
 
@@ -380,10 +420,7 @@ static void uploadNoise(SSAOTarget& s, VkPhysicalDevice physicalDevice, VkDevice
     auto staging = createBuffer(physicalDevice, device, sizeof(pixels),
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    void* mapped;
-    vkMapMemory(device, staging.memory, 0, sizeof(pixels), 0, &mapped);
-    std::memcpy(mapped, pixels, sizeof(pixels));
-    vkUnmapMemory(device, staging.memory);
+    std::memcpy(staging.mapped, pixels, sizeof(pixels));
 
     transitionImageLayout(device, commandPool, queue, s.noiseImage.image,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1);
@@ -442,7 +479,7 @@ void createSSAO(SSAOTarget& s, VkPhysicalDevice physicalDevice, VkDevice device,
         s.ubos[i] = createBuffer(physicalDevice, device, size,
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkMapMemory(device, s.ubos[i].memory, 0, size, 0, &s.uboMapped[i]);
+        s.uboMapped[i] = s.ubos[i].mapped;
     }
 }
 
@@ -452,14 +489,12 @@ void destroySSAO(VkDevice device, SSAOTarget& s) {
     s.uboMapped.clear();
     if (s.noiseSampler) vkDestroySampler(device, s.noiseSampler, nullptr);
     if (s.noiseView)    vkDestroyImageView(device, s.noiseView, nullptr);
-    if (s.noiseImage.image)  { vkDestroyImage(device, s.noiseImage.image, nullptr);
-                                vkFreeMemory(device, s.noiseImage.memory, nullptr); }
+    destroyImage(device, s.noiseImage);
     if (s.sampler)     vkDestroySampler(device, s.sampler, nullptr);
     if (s.framebuffer) vkDestroyFramebuffer(device, s.framebuffer, nullptr);
     if (s.renderPass)  vkDestroyRenderPass(device, s.renderPass, nullptr);
     if (s.view)        vkDestroyImageView(device, s.view, nullptr);
-    if (s.image.image) { vkDestroyImage(device, s.image.image, nullptr);
-                          vkFreeMemory(device, s.image.memory, nullptr); }
+    destroyImage(device, s.image);
     s = {};
 }
 
@@ -481,6 +516,10 @@ struct CompositeUboCpu {
     int   enableSSAO;
     int   enableBloom;
     int   debugView;
+    // DoF (x = enable, y = focusDist, z = focusRange, w = maxBokehRadiusPx)
+    glm::vec4 dofParams;
+    // Camera depth linearisation (x = near, y = far)
+    glm::vec4 cameraClip;
 };
 
 void createCompositeData(CompositeData& c, VkPhysicalDevice physicalDevice, VkDevice device,
@@ -493,7 +532,7 @@ void createCompositeData(CompositeData& c, VkPhysicalDevice physicalDevice, VkDe
         c.ubos[i] = createBuffer(physicalDevice, device, size,
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkMapMemory(device, c.ubos[i].memory, 0, size, 0, &c.uboMapped[i]);
+        c.uboMapped[i] = c.ubos[i].mapped;
     }
 }
 
@@ -538,10 +577,7 @@ void destroyLdrTarget(VkDevice device, LdrTarget& t) {
     if (t.framebuffer) vkDestroyFramebuffer(device, t.framebuffer, nullptr);
     if (t.renderPass)  vkDestroyRenderPass(device, t.renderPass, nullptr);
     if (t.view)        vkDestroyImageView(device, t.view, nullptr);
-    if (t.image.image) {
-        vkDestroyImage(device, t.image.image, nullptr);
-        vkFreeMemory(device, t.image.memory, nullptr);
-    }
+    destroyImage(device, t.image);
     t = {};
 }
 
@@ -560,6 +596,11 @@ void updateCompositeUbo(CompositeData& c, uint32_t frameIndex, const PostFXSetti
     u.enableSSAO        = s.ssaoEnabled  ? 1 : 0;
     u.enableBloom       = s.bloomEnabled ? 1 : 0;
     u.debugView         = s.debugView;
+    u.dofParams         = glm::vec4(s.dofEnabled ? 1.0f : 0.0f,
+                                    s.dofFocusDistance,
+                                    glm::max(s.dofFocusRange, 0.0001f),
+                                    glm::max(s.dofBokehRadius, 0.0f));
+    u.cameraClip        = glm::vec4(s.nearClip, s.farClip, 0.0f, 0.0f);
     std::memcpy(c.uboMapped[frameIndex], &u, sizeof(u));
 }
 
@@ -729,8 +770,9 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
     uint32_t totalSets    = bloomSets + framesInFlight /*ssao*/ + framesInFlight /*composite*/ + 1 /*fxaa*/;
 
     VkDescriptorPoolSize sizes[] = {
+        // Composite now uses 4 samplers per frame (hdr, bloom, ssao, depth).
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-          bloomSets + framesInFlight * 2 /*ssao*/ + framesInFlight * 3 /*comp*/ + 1 /*fxaa*/ },
+          bloomSets + framesInFlight * 2 /*ssao*/ + framesInFlight * 4 /*comp*/ + 1 /*fxaa*/ },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         framesInFlight + framesInFlight },
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -790,9 +832,9 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
     p.ssao = makeFullscreenPipeline(device, ssao.renderPass, p.ssaoLayout,
                                     "shaders/ssao.frag.spv");
 
-    // ── Composite set layout: hdr (0), bloom (1), ssao (2), UBO (3) ─────
+    // ── Composite set layout: hdr (0), bloom (1), ssao (2), UBO (3), depth (4) ─
     {
-        std::vector<VkDescriptorSetLayoutBinding> bindings(4);
+        std::vector<VkDescriptorSetLayoutBinding> bindings(5);
         for (int i = 0; i < 3; ++i) {
             bindings[i] = {}; bindings[i].binding = i;
             bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -802,6 +844,10 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
         bindings[3] = {}; bindings[3].binding = 3;
         bindings[3].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[3].descriptorCount = 1; bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        // Depth attachment — sampled by composite.frag for DoF CoC computation.
+        bindings[4] = {}; bindings[4].binding = 4;
+        bindings[4].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[4].descriptorCount = 1; bindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         p.compositeSetLayout = makeDescriptorSetLayout(device, bindings);
     }
     {
@@ -951,7 +997,12 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
         bufInfo.buffer = composite.ubos[f].buffer;
         bufInfo.range  = sizeof(CompositeUboCpu);
 
-        VkWriteDescriptorSet writes[4]{};
+        VkDescriptorImageInfo depthInfo{};
+        depthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        depthInfo.imageView   = offscreen.depthView;
+        depthInfo.sampler     = offscreen.depthSampler;
+
+        VkWriteDescriptorSet writes[5]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = composite.descriptorSets[f]; writes[0].dstBinding = 0;
         writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -962,7 +1013,8 @@ void createPostFXPipelines(PostFXPipelines& p, VkDevice device, BloomChain& bloo
         writes[3].dstSet = composite.descriptorSets[f]; writes[3].dstBinding = 3;
         writes[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         writes[3].descriptorCount = 1; writes[3].pBufferInfo = &bufInfo;
-        vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+        writes[4] = writes[0]; writes[4].dstBinding = 4; writes[4].pImageInfo = &depthInfo;
+        vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
     }
 }
 

@@ -7,6 +7,7 @@
 #include "jobs.h"
 #include "gpu_cull.h"
 #include "vulkan_init.h"
+#include "profiler.h"
 #include "../utils/vk_check.h"
 
 #include <imgui.h>
@@ -16,7 +17,9 @@
 #include <stdexcept>
 #include <array>
 #include <algorithm>
+#include <cassert>
 #include <cstring>
+#include <iostream>
 
 // ── Command pool & buffers ──────────────────────────────────────────────────
 
@@ -50,46 +53,19 @@ void allocateCommandBuffers(RendererData& data, VkDevice device) {
 //     packed by LOD assignment. Drawn with lodMesh[i] in the main pass.
 //   * indirect: lodCount main commands + 1 shadow command, contiguous.
 
-struct EffectiveLOD {
-    uint32_t   count = 1;
-    MeshHandle mesh[MAX_LOD]{};
-    float      maxDist[MAX_LOD]{};
-    glm::vec3  aabbMin{0}, aabbMax{0};   // taken from LOD0 mesh
-};
-
-static EffectiveLOD resolveLOD(entt::entity e, entt::registry& reg, ResourceManager& res) {
-    EffectiveLOD out;
-    if (auto* lod = reg.try_get<MeshLODComponent>(e); lod && res.hasLODGroup(lod->group)) {
-        const auto& g = res.getLODGroup(lod->group);
-        out.count = std::min<uint32_t>(static_cast<uint32_t>(g.levels.size()), MAX_LOD);
-        for (uint32_t i = 0; i < out.count; ++i) {
-            out.mesh[i]    = g.levels[i].mesh;
-            out.maxDist[i] = g.levels[i].maxDistance;
-        }
-        // Force last threshold to infinity so distance fall-through always
-        // selects a valid LOD even if the user under-specifies.
-        out.maxDist[out.count - 1] = std::numeric_limits<float>::max();
-        const Mesh& m0 = res.getMesh(out.mesh[0]);
-        out.aabbMin = m0.aabbMin;
-        out.aabbMax = m0.aabbMax;
-    } else {
-        auto* mc = reg.try_get<MeshComponent>(e);
-        out.count       = 1;
-        out.mesh[0]     = mc ? mc->handle : MeshHandle{0};
-        out.maxDist[0]  = std::numeric_limits<float>::max();
-        const Mesh& m0  = res.getMesh(out.mesh[0]);
-        out.aabbMin     = m0.aabbMin;
-        out.aabbMax     = m0.aabbMax;
-    }
-    return out;
-}
+// `EffectiveLOD` is defined in renderer.h (shared with ResolvedEntity).
+// resolveLOD() used to live here as a helper; the work is now inlined into
+// resolveAndPopulateSpatial below since the single-walk consolidation needs
+// fine control over which fields it captures and where the work lands.
 
 struct InstanceBatch {
     EffectiveLOD  lod;
     TextureHandle texture;
     uint32_t      shadowOffset;
     uint32_t      lodBase[MAX_LOD];
+    uint32_t      lodBaseLate[MAX_LOD];     // pass-1 ranges (Phase 2.2)
     uint32_t      lodCmdIndex[MAX_LOD];
+    uint32_t      lodCmdLateIndex[MAX_LOD]; // pass-1 cmds
     uint32_t      shadowCmdIndex;
     uint32_t      reservedCount;        // entities assigned to this batch
 };
@@ -112,49 +88,120 @@ static uint64_t makeBatchKey(const EffectiveLOD& lod, uint32_t textureId,
     return (upper << 32) | textureId;
 }
 
+// `ResolvedEntity` is defined in renderer.h so RendererData can hold a
+// std::vector<ResolvedEntity> directly (persisted across frames for capacity).
+
+// Single registry walk: enumerate the drawable view, resolve LOD chain,
+// fetch local AABB, transform to world space, compute batch key, snapshot
+// transform + material. Also populates the spatial index with each entry's
+// AABB + a userIndex back into `resolved`.
+//
+// `outTotal` reports the total entity count for the UI; visible-after-cull
+// is the size of the queryFrustum result vector.
+static void resolveAndPopulateSpatial(
+    SpatialIndex& spatial,
+    std::vector<ResolvedEntity>& resolved,
+    entt::registry& registry,
+    ResourceManager& resources,
+    int& outTotal)
+{
+    auto view = registry.view<TransformComponent, MeshComponent, MaterialComponent>();
+    resolved.clear();
+    resolved.reserve(view.size_hint());
+
+    for (auto entity : view) {
+        const auto& tr  = view.get<TransformComponent>(entity);
+        const auto& mat = view.get<MaterialComponent>(entity);
+
+        ResolvedEntity r;
+        r.entity    = entity;
+        r.transform = tr;
+        r.material  = mat;
+        r.texture   = mat.texture;
+
+        // LOD resolution — single try_get; the result feeds both the AABB
+        // source (LOD0 mesh) and the batch key.
+        auto* lodComp = registry.try_get<MeshLODComponent>(entity);
+        bool hasGroup = lodComp && resources.hasLODGroup(lodComp->group);
+
+        uint32_t keyId;
+        if (hasGroup) {
+            const auto& g = resources.getLODGroup(lodComp->group);
+            r.lod.count = std::min<uint32_t>(static_cast<uint32_t>(g.levels.size()), MAX_LOD);
+            for (uint32_t k = 0; k < r.lod.count; ++k) {
+                r.lod.mesh[k]    = g.levels[k].mesh;
+                r.lod.maxDist[k] = g.levels[k].maxDistance;
+            }
+            r.lod.maxDist[r.lod.count - 1] = std::numeric_limits<float>::max();
+            keyId = lodComp->group.id;
+        } else {
+            const auto& mc = view.get<MeshComponent>(entity);
+            r.lod.count       = 1;
+            r.lod.mesh[0]     = mc.handle;
+            r.lod.maxDist[0]  = std::numeric_limits<float>::max();
+            keyId = mc.handle.id;
+        }
+
+        // AABB from LOD0's mesh (or the single mesh in the no-group case).
+        const Mesh& m0 = resources.getMesh(r.lod.mesh[0]);
+        r.lod.aabbMin  = m0.aabbMin;
+        r.lod.aabbMax  = m0.aabbMax;
+        transformAabb(tr.getMatrix(), r.lod.aabbMin, r.lod.aabbMax, r.wMin, r.wMax);
+
+        r.batchKey = makeBatchKey(r.lod, mat.texture.id, hasGroup, keyId);
+
+        resolved.push_back(r);
+    }
+
+    outTotal = static_cast<int>(resolved.size());
+
+    // Mirror into the spatial index. userIndex preserves the back-link
+    // through the BVH's median-split reordering.
+    spatial.resizeForBulkInsert(resolved.size());
+    for (size_t i = 0; i < resolved.size(); ++i) {
+        SpatialIndex::Entry e;
+        e.entity    = resolved[i].entity;
+        e.wMin      = resolved[i].wMin;
+        e.wMax      = resolved[i].wMax;
+        e.userIndex = static_cast<uint32_t>(i);
+        spatial.mutableEntry(i) = e;
+    }
+    spatial.build();
+}
+
 static CullBuildResult buildCandidates(
-    entt::registry& registry, ResourceManager& resources,
+    ResourceManager& resources,
+    const std::vector<ResolvedEntity>& resolved,
+    const std::vector<SpatialIndex::Entry>& visibleEntries,
     CandidateInstance* candidatesMapped, uint32_t candidateCapacity,
     BatchHeader* headersMapped,          uint32_t headerCapacity,
     VkDrawIndexedIndirectCommand* indirectMapped, uint32_t indirectCapacity,
     uint32_t mainInstanceCapacity, uint32_t shadowInstanceCapacity,
-    int& outTotal,
-    JobSystem* jobs)
+    JobSystem* jobs,
+    const std::unordered_map<entt::entity, glm::mat4>* prevTransforms)
 {
     CullBuildResult out;
 
+    // EntityRef is now a lightweight reference into the resolved array plus
+    // the assigned batch index. All per-entity data was computed during the
+    // single resolve walk in resolveAndPopulateSpatial; we just need to sort
+    // by batchKey and assign batches.
     struct EntityRef {
-        EffectiveLOD       lod;
-        TextureHandle      texture;
-        TransformComponent transform;
-        MaterialComponent  material;
-        uint64_t           batchKey;
-        uint32_t           batchIndex;  // assigned in stage 3
+        uint32_t resolvedIdx;   // index into `resolved`
+        uint64_t batchKey;      // copied for sort locality
+        uint32_t batchIndex;    // assigned in stage 3
     };
 
     std::vector<EntityRef> refs;
-    refs.reserve(256);
+    refs.resize(visibleEntries.size());
 
-    auto view = registry.view<TransformComponent, MeshComponent, MaterialComponent>();
-    for (auto entity : view) {
-        auto& tr  = view.get<TransformComponent>(entity);
-        auto& mat = view.get<MaterialComponent>(entity);
-
-        EntityRef r;
-        r.lod       = resolveLOD(entity, registry, resources);
-        r.texture   = mat.texture;
-        r.transform = tr;
-        r.material  = mat;
-
-        bool hasGroup = registry.all_of<MeshLODComponent>(entity)
-                     && resources.hasLODGroup(registry.get<MeshLODComponent>(entity).group);
-        uint32_t keyId = hasGroup
-            ? registry.get<MeshLODComponent>(entity).group.id
-            : view.get<MeshComponent>(entity).handle.id;
-        r.batchKey = makeBatchKey(r.lod, mat.texture.id, hasGroup, keyId);
-        refs.push_back(r);
+    // Gather: zero registry hits, just copy index + key from the pre-resolved
+    // array. The BVH preserved userIndex through its median-split reorder.
+    for (size_t i = 0; i < visibleEntries.size(); ++i) {
+        const ResolvedEntity& r = resolved[visibleEntries[i].userIndex];
+        refs[i].resolvedIdx = visibleEntries[i].userIndex;
+        refs[i].batchKey    = r.batchKey;
     }
-    outTotal = static_cast<int>(refs.size());
 
     if (refs.empty() || candidatesMapped == nullptr) {
         return out;
@@ -167,15 +214,17 @@ static CullBuildResult buildCandidates(
     std::sort(order.begin(), order.end(),
         [&](uint32_t a, uint32_t b) { return refs[a].batchKey < refs[b].batchKey; });
 
-    // Stage: create batches, assign batchIndex to each EntityRef.
+    // Stage: create batches, assign batchIndex to each EntityRef. LOD chain
+    // and texture come from the pre-resolved entity record.
     {
         uint64_t prev = ~refs[order[0]].batchKey; // force first miss
         for (uint32_t k = 0; k < order.size(); ++k) {
             uint32_t i = order[k];
+            const ResolvedEntity& re = resolved[refs[i].resolvedIdx];
             if (refs[i].batchKey != prev) {
                 InstanceBatch b{};
-                b.lod           = refs[i].lod;
-                b.texture       = refs[i].texture;
+                b.lod           = re.lod;
+                b.texture       = re.texture;
                 b.reservedCount = 0;
                 out.batches.push_back(b);
                 prev = refs[i].batchKey;
@@ -187,33 +236,54 @@ static CullBuildResult buildCandidates(
     out.numBatches = static_cast<uint32_t>(out.batches.size());
 
     // Stage: allocate instance-buffer ranges + indirect command slots per batch.
-    // Main: per-LOD reservation = lodCount × reservedCount slots (worst case
-    // all entities pick the same LOD). Shadow: reservedCount slots.
-    // Indirect: lodCount main cmds + 1 shadow cmd per batch, contiguous.
+    // Two-pass occlusion (Phase 2.2) doubles the per-LOD reservation: pass 0
+    // writes into lodBase[]/lodCmd[], pass 1 writes into the disjoint
+    // lodBaseLate[]/lodCmdLate[] ranges. Worst-case total per batch:
+    //   * main:   2 * lodCount * reservedCount slots
+    //   * shadow: reservedCount slots (single pass)
+    //   * indirect: 2 * lodCount main cmds + 1 shadow cmd
     {
         uint32_t mainCursor    = 0;
         uint32_t shadowCursor  = 0;
         uint32_t cmdCursor     = 0;
         for (auto& b : out.batches) {
+            // Pass-0 main ranges
             for (uint32_t i = 0; i < b.lod.count; ++i) {
                 b.lodBase[i] = mainCursor;
                 mainCursor  += b.reservedCount;
             }
+            // Pass-1 main ranges (disjoint, contiguous after pass-0's)
+            for (uint32_t i = 0; i < b.lod.count; ++i) {
+                b.lodBaseLate[i] = mainCursor;
+                mainCursor      += b.reservedCount;
+            }
             b.shadowOffset  = shadowCursor;
             shadowCursor   += b.reservedCount;
 
+            // Pass-0 main cmds
             for (uint32_t i = 0; i < b.lod.count; ++i) {
                 b.lodCmdIndex[i] = cmdCursor++;
+            }
+            // Pass-1 main cmds
+            for (uint32_t i = 0; i < b.lod.count; ++i) {
+                b.lodCmdLateIndex[i] = cmdCursor++;
             }
             b.shadowCmdIndex = cmdCursor++;
         }
         // Bail out if any pool would overflow — drops this frame's draws but
-        // keeps the renderer alive.
+        // keeps the renderer alive. Log loudly so the user knows why the
+        // screen suddenly went blank, instead of silently rendering nothing.
         if (mainCursor   > mainInstanceCapacity   ||
             shadowCursor > shadowInstanceCapacity ||
             cmdCursor    > indirectCapacity       ||
             out.numBatches > headerCapacity)
         {
+            std::cerr << "[VulkanEngine] Cull buffer overflow — frame dropped. "
+                      << "mainCursor=" << mainCursor << "/" << mainInstanceCapacity
+                      << " shadowCursor=" << shadowCursor << "/" << shadowInstanceCapacity
+                      << " cmdCursor=" << cmdCursor << "/" << indirectCapacity
+                      << " batches=" << out.numBatches << "/" << headerCapacity
+                      << ". Increase MAX_INSTANCES_PER_FRAME / MAX_BATCHES_PER_FRAME.\n";
             return CullBuildResult{};
         }
     }
@@ -222,19 +292,26 @@ static CullBuildResult buildCandidates(
     for (uint32_t bi = 0; bi < out.numBatches; ++bi) {
         auto& b = out.batches[bi];
 
+        // Pass-0 + pass-1 main cmds. Same index count per LOD; instanceCount=0,
+        // populated atomically by cull.comp.
         for (uint32_t i = 0; i < b.lod.count; ++i) {
             const Mesh& mesh = resources.getMesh(b.lod.mesh[i]);
+            assert(mesh.indices.size() <= std::numeric_limits<uint32_t>::max()
+                   && "Mesh index count exceeds uint32_t");
             VkDrawIndexedIndirectCommand cmd{};
             cmd.indexCount    = static_cast<uint32_t>(mesh.indices.size());
             cmd.instanceCount = 0;
             cmd.firstIndex    = 0;
             cmd.vertexOffset  = 0;
             cmd.firstInstance = 0;
-            indirectMapped[b.lodCmdIndex[i]] = cmd;
+            indirectMapped[b.lodCmdIndex[i]]     = cmd;  // pass 0
+            indirectMapped[b.lodCmdLateIndex[i]] = cmd;  // pass 1 (same shape)
         }
-        // Shadow uses LOD0.
+        // Shadow uses LOD0, no two-pass.
         {
             const Mesh& m0 = resources.getMesh(b.lod.mesh[0]);
+            assert(m0.indices.size() <= std::numeric_limits<uint32_t>::max()
+                   && "Mesh index count exceeds uint32_t");
             VkDrawIndexedIndirectCommand cmd{};
             cmd.indexCount    = static_cast<uint32_t>(m0.indices.size());
             cmd.instanceCount = 0;
@@ -245,50 +322,66 @@ static CullBuildResult buildCandidates(
         }
 
         BatchHeader h{};
-        h.shadowBase = b.shadowOffset;
-        h.shadowCmd  = b.shadowCmdIndex;
-        h.lodCount   = b.lod.count;
+        h.shadowBase    = b.shadowOffset;
+        h.shadowCmd     = b.shadowCmdIndex;
+        h.lodCount      = b.lod.count;
+        h.shadowLodBias = 0;   // LOD0 by default — distant casters can opt up.
         for (uint32_t i = 0; i < b.lod.count; ++i) {
-            h.lodBase[i] = b.lodBase[i];
-            h.lodCmd [i] = b.lodCmdIndex[i];
-            h.lodDist[i] = b.lod.maxDist[i];
+            h.lodBase[i]     = b.lodBase[i];
+            h.lodCmd [i]     = b.lodCmdIndex[i];
+            h.lodDist[i]     = b.lod.maxDist[i];
+            h.lodBaseLate[i] = b.lodBaseLate[i];
+            h.lodCmdLate [i] = b.lodCmdLateIndex[i];
         }
         headersMapped[bi] = h;
     }
 
-    // Stage: write candidate stream (parallel for >256 entities).
+    // Stage: write candidate stream. Reads the pre-resolved entity record
+    // directly — every per-entity field (transform, material, texture, world
+    // AABB) was filled during the single resolve walk.
     const uint32_t toWrite = std::min(static_cast<uint32_t>(refs.size()), candidateCapacity);
-    auto computeOne = [&](size_t i) {
-        const auto& r = refs[i];
-        glm::mat4 model = r.transform.getMatrix();
-        glm::vec3 wMin, wMax;
-        transformAabb(model, r.lod.aabbMin, r.lod.aabbMax, wMin, wMax);
-        glm::mat3 nm = glm::transpose(glm::inverse(glm::mat3(model)));
+    for (uint32_t i = 0; i < toWrite; ++i) {
+        const EntityRef& ref = refs[i];
+        const ResolvedEntity& r = resolved[ref.resolvedIdx];
+
+        // TransformComponent's matrix + normal-matrix cache are populated on
+        // first access; for static entities subsequent frames are float
+        // compare + early return.
+        const glm::mat4& model = r.transform.getMatrix();
+        const glm::mat3& nm    = r.transform.getNormalMatrix();
+
+        // Previous-frame model from the engine-owned cache. On first
+        // appearance, fall back to current model so motion is zero rather
+        // than a huge spike from a stale identity.
+        glm::mat4 prevModel = model;
+        if (prevTransforms) {
+            auto it = prevTransforms->find(r.entity);
+            if (it != prevTransforms->end()) prevModel = it->second;
+        }
 
         CandidateInstance c;
         c.data.model      = model;
         c.data.colorTint  = r.material.color;
         c.data.matParams  = glm::vec4(r.material.metallic, r.material.roughness,
-                                       static_cast<float>(r.texture.id), 0.0f);
+                                       static_cast<float>(r.texture.id),
+                                       static_cast<float>(r.material.normalTexture.id));
         c.data.normalCol0 = glm::vec4(nm[0], 0.0f);
         c.data.normalCol1 = glm::vec4(nm[1], 0.0f);
         c.data.normalCol2 = glm::vec4(nm[2], 0.0f);
+        c.data.prevModel  = prevModel;
+        c.data.matParams2 = glm::vec4(
+            static_cast<float>(r.material.heightTexture.id),
+            r.material.parallaxScale,
+            0.0f, 0.0f);
 
-        uint32_t bi = r.batchIndex;
-        c.aabbMin = glm::vec4(wMin, 0.0f);
-        std::memcpy(&c.aabbMin.w, &bi, sizeof(uint32_t));
-        c.aabbMax = glm::vec4(wMax, 0.0f);
+        c.aabbMin = glm::vec4(r.wMin, glm::uintBitsToFloat(ref.batchIndex));
+        c.aabbMax = glm::vec4(r.wMax, 0.0f);
 
         candidatesMapped[i] = c;
-    };
-
-    if (jobs && toWrite > 256) {
-        jobs->parallel_for(toWrite, computeOne);
-    } else {
-        for (uint32_t i = 0; i < toWrite; ++i) computeOne(i);
     }
 
     out.numCandidates = toWrite;
+    (void)jobs; (void)resources;
     return out;
 }
 
@@ -300,7 +393,9 @@ static void recordShadowPass(VkCommandBuffer cmd, ShadowData& shadow,
                              const std::vector<InstanceBatch>& batches,
                              VkBuffer shadowInstanceBuffer,
                              VkBuffer indirectBuffer,
-                             ResourceManager& resources)
+                             ResourceManager& resources,
+                             const DrawFrameInfo& info,
+                             uint32_t frame)
 {
     VkClearValue clear{};
     clear.depthStencil = { 1.0f, 0 };
@@ -315,8 +410,9 @@ static void recordShadowPass(VkCommandBuffer cmd, ShadowData& shadow,
         rp.pClearValues      = &clear;
 
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline);
 
+        // ── Static (instanced) shadow draws ────────────────────────────────
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline);
         vkCmdPushConstants(cmd, shadowLayout, VK_SHADER_STAGE_VERTEX_BIT,
                            0, sizeof(glm::mat4), &cascadeUbo.lightViewProj[c]);
 
@@ -334,8 +430,45 @@ static void recordShadowPass(VkCommandBuffer cmd, ShadowData& shadow,
             vkCmdDrawIndexedIndirect(cmd, indirectBuffer, cmdOffset, 1,
                                      sizeof(VkDrawIndexedIndirectCommand));
         }
+
+        // ── Skinned shadow draws ───────────────────────────────────────────
+        // Walk every entity with SkinnedMeshComponent + TransformComponent.
+        // Single skinned mesh per scene (engine.cpp owns one m_skinnedMesh);
+        // each entity reuses the same vertex/index buffer + bone palette but
+        // has its own world transform.
+        if (info.skinnedMesh && info.skinnedShadowPipeline != VK_NULL_HANDLE) {
+            auto& reg = *info.registry;
+            auto sview = reg.view<TransformComponent, SkinnedMeshComponent>();
+            if (sview.begin() != sview.end()) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  info.skinnedShadowPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        info.skinnedShadowLayout, 0, 1,
+                                        &info.boneDescriptorSet, 0, nullptr);
+
+                VkBuffer vbs[]   = { info.skinnedMesh->vertexBuffer.buffer };
+                VkDeviceSize off[] = { 0 };
+                vkCmdBindVertexBuffers(cmd, 0, 1, vbs, off);
+                vkCmdBindIndexBuffer(cmd, info.skinnedMesh->indexBuffer.buffer, 0,
+                                     VK_INDEX_TYPE_UINT32);
+
+                for (auto e : sview) {
+                    glm::mat4 push[2] = {
+                        cascadeUbo.lightViewProj[c],
+                        sview.get<TransformComponent>(e).getMatrix(),
+                    };
+                    vkCmdPushConstants(cmd, info.skinnedShadowLayout,
+                                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+                    vkCmdDrawIndexed(cmd,
+                                     static_cast<uint32_t>(info.skinnedMesh->indices.size()),
+                                     1, 0, 0, 0);
+                }
+            }
+        }
+
         vkCmdEndRenderPass(cmd);
     }
+    (void)frame;
 }
 
 // ── Main pass ───────────────────────────────────────────────────────────────
@@ -366,9 +499,12 @@ static void recordMainPass(VkCommandBuffer cmd, OffscreenTarget& offscreen,
                            VkBuffer mainInstanceBuffer,
                            VkBuffer indirectBuffer,
                            ResourceManager& resources,
-                           int vrsMode)
+                           int vrsMode,
+                           bool latePass)
 {
-    // Offscreen render pass now has 3 attachments: color, motion, depth.
+    // Two-pass occlusion (Phase 2.2): pass A uses the CLEAR renderpass and
+    // pass-0 indirect slots; pass B uses the LOAD renderpass and pass-1 slots
+    // (newly-revealed objects only).
     std::array<VkClearValue, 3> clearValues{};
     clearValues[0].color.float32[0] = 0.05f;
     clearValues[0].color.float32[1] = 0.06f;
@@ -381,11 +517,14 @@ static void recordMainPass(VkCommandBuffer cmd, OffscreenTarget& offscreen,
 
     VkRenderPassBeginInfo rpBegin{};
     rpBegin.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpBegin.renderPass        = offscreen.renderPass;
+    rpBegin.renderPass        = latePass ? offscreen.renderPassLate : offscreen.renderPass;
     rpBegin.framebuffer       = offscreen.framebuffer;
     rpBegin.renderArea.extent = offscreen.extent;
-    rpBegin.clearValueCount   = static_cast<uint32_t>(clearValues.size());
-    rpBegin.pClearValues      = clearValues.data();
+    // LOAD renderpass ignores clear values; pass them only for the CLEAR path.
+    if (!latePass) {
+        rpBegin.clearValueCount   = static_cast<uint32_t>(clearValues.size());
+        rpBegin.pClearValues      = clearValues.data();
+    }
 
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -415,13 +554,17 @@ static void recordMainPass(VkCommandBuffer cmd, OffscreenTarget& offscreen,
     }
 
     // Per batch: iterate the batch's LODs and issue one indirect draw each.
+    // Pass A reads lodBase / lodCmdIndex; pass B reads the disjoint late slots.
     for (const auto& batch : batches) {
         if (batch.reservedCount == 0) continue;
         for (uint32_t i = 0; i < batch.lod.count; ++i) {
             const Mesh& mesh = resources.getMesh(batch.lod.mesh[i]);
 
+            uint32_t baseSlot = latePass ? batch.lodBaseLate[i]     : batch.lodBase[i];
+            uint32_t cmdSlot  = latePass ? batch.lodCmdLateIndex[i] : batch.lodCmdIndex[i];
+
             VkBuffer vbs[] = { mesh.vertexBuffer.buffer, mainInstanceBuffer };
-            VkDeviceSize offsets[] = { 0, batch.lodBase[i] * sizeof(InstanceData) };
+            VkDeviceSize offsets[] = { 0, baseSlot * sizeof(InstanceData) };
             vkCmdBindVertexBuffers(cmd, 0, 2, vbs, offsets);
             vkCmdBindIndexBuffer(cmd, mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
@@ -430,7 +573,7 @@ static void recordMainPass(VkCommandBuffer cmd, OffscreenTarget& offscreen,
                 VRS_SetRate(cmd, &rate, combiners);
             }
 
-            VkDeviceSize cmdOffset = static_cast<VkDeviceSize>(batch.lodCmdIndex[i])
+            VkDeviceSize cmdOffset = static_cast<VkDeviceSize>(cmdSlot)
                                    * sizeof(VkDrawIndexedIndirectCommand);
             vkCmdDrawIndexedIndirect(cmd, indirectBuffer, cmdOffset, 1,
                                      sizeof(VkDrawIndexedIndirectCommand));
@@ -474,11 +617,16 @@ static void recordSkinnedDraws(VkCommandBuffer cmd, const DrawFrameInfo& info, u
             glm::mat4 model;
             glm::vec4 color;
             glm::vec4 matParams;
+            glm::vec4 matParams2;
         } pc;
         pc.model     = tr.getMatrix();
         pc.color     = mat.color;
         pc.matParams = glm::vec4(mat.metallic, mat.roughness,
-                                  static_cast<float>(mat.texture.id), 0.0f);
+                                  static_cast<float>(mat.texture.id),
+                                  static_cast<float>(mat.normalTexture.id));
+        // Skinned vertex format has no per-vertex tangent yet, so leave
+        // parallax disabled even if the material has a height map assigned.
+        pc.matParams2 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
         vkCmdPushConstants(cmd, info.skinnedLayout, VK_SHADER_STAGE_VERTEX_BIT,
                            0, sizeof(SkinnedPC), &pc);
 
@@ -569,7 +717,11 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
     uint32_t frame = renderer.currentFrame;
 
     vkWaitForFences(device, 1, &swapchain.inFlightFences[frame], VK_TRUE, UINT64_MAX);
-    updateUniformBuffer(*info.descriptors, frame, *info.ubo);
+    {
+        auto _ = info.profiler ? info.profiler->cpuScope("updateUniformBuffer")
+                                : Profiler::CpuGuard(nullptr, nullptr);
+        updateUniformBuffer(*info.descriptors, frame, *info.ubo);
+    }
 
     uint32_t imageIndex;
     VkResult result = vkAcquireNextImageKHR(
@@ -582,30 +734,54 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
         throw std::runtime_error("Failed to acquire swapchain image");
     }
 
-    // Late stats readback (one frame lag). The shadow commands are interleaved
-    // with main commands now (one shadow per batch right after its LOD cmds),
-    // so the old "first half = main" heuristic no longer works. We can't easily
-    // separate visible main from shadow counts without per-frame metadata —
-    // expose only the total instances drawn by main (sum LODs) via a future
-    // mechanism. For now report visibleEntities = -1 (unknown) so the UI can
-    // skip it.
-    if (info.visibleEntities) *info.visibleEntities = -1;
+    // visibleEntities is now reported by the CPU pre-cull below (post-spatial
+    // query, pre-GPU occlusion cull). This is the "frustum-visible" count, not
+    // the "passed occlusion + on-screen" count — the latter would need a
+    // round-trip from the GPU and would lag a frame anyway.
 
     vkResetFences(device, 1, &swapchain.inFlightFences[frame]);
 
-    // ── CPU: build candidate stream + pre-author indirect commands ─────────
+    // ── CPU pre-cull: walk all entities, build a per-frame BVH, query the
+    //    camera frustum so the heavy candidate-build runs only on visibles ──
     int total = 0;
-    auto build = buildCandidates(
-        *info.registry, *info.resources,
-        static_cast<CandidateInstance*>(info.candidates->mapped[frame]),
-        info.candidates->capacity,
-        static_cast<BatchHeader*>(info.batchHeaders->mapped[frame]),
-        info.batchHeaders->capacity,
-        static_cast<VkDrawIndexedIndirectCommand*>(info.indirect->mapped[frame]),
-        info.indirect->capacity,
-        info.mainInstances->capacity, info.shadowInstances->capacity,
-        total, info.jobSystem);
+    {
+        auto _ = info.profiler ? info.profiler->cpuScope("resolve + spatial build")
+                                : Profiler::CpuGuard(nullptr, nullptr);
+        resolveAndPopulateSpatial(renderer.spatial, renderer.resolved,
+                                  *info.registry, *info.resources, total);
+    }
     if (info.totalEntities) *info.totalEntities = total;
+
+    // Frustum used for the CPU pre-cull is the SAME one the GPU cull receives
+    // via CullParamsUBO (engine.cpp populated cullParams->frustumPlanes from
+    // the current view-proj). Build a Frustum struct from those planes.
+    Frustum cpuFrustum;
+    for (int i = 0; i < 6; ++i) cpuFrustum.planes[i] = info.cullParams->frustumPlanes[i];
+
+    {
+        auto _ = info.profiler ? info.profiler->cpuScope("spatial query")
+                                : Profiler::CpuGuard(nullptr, nullptr);
+        renderer.spatial.queryFrustum(cpuFrustum, renderer.visibleEntries);
+    }
+    if (info.visibleEntities) *info.visibleEntities = static_cast<int>(renderer.visibleEntries.size());
+
+    CullBuildResult build;
+    {
+        auto _ = info.profiler ? info.profiler->cpuScope("buildCandidates")
+                                : Profiler::CpuGuard(nullptr, nullptr);
+        build = buildCandidates(
+            *info.resources,
+            renderer.resolved,
+            renderer.visibleEntries,
+            static_cast<CandidateInstance*>(info.candidates->mapped[frame]),
+            info.candidates->capacity,
+            static_cast<BatchHeader*>(info.batchHeaders->mapped[frame]),
+            info.batchHeaders->capacity,
+            static_cast<VkDrawIndexedIndirectCommand*>(info.indirect->mapped[frame]),
+            info.indirect->capacity,
+            info.mainInstances->capacity, info.shadowInstances->capacity,
+            info.jobSystem, info.prevTransforms);
+    }
 
     VkBuffer mainInstBuf   = info.mainInstances->buffers[frame].buffer;
     VkBuffer shadowInstBuf = info.shadowInstances->buffers[frame].buffer;
@@ -618,6 +794,11 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
+    // Profiler: read back previous frame's GPU timestamps and reset the pool
+    // for this frame's writes. Must run BEFORE any gpuBegin/gpuEnd, and AFTER
+    // vkWaitForFences so the prior submission's writes are visible.
+    if (info.profiler) info.profiler->beginFrame(device, cmd, frame);
+
     // ── TLAS build (RT) ─────────────────────────────────────────────────────
     // Walk the visible meshes and gather their world transforms + BLAS
     // addresses, then rebuild the TLAS into the per-frame buffer. The build
@@ -627,6 +808,9 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
         std::vector<RtInstanceDesc> rtInstances;
         rtInstances.reserve(static_cast<size_t>(total));
 
+        {
+        auto _ = info.profiler ? info.profiler->cpuScope("TLAS instance gather")
+                                : Profiler::CpuGuard(nullptr, nullptr);
         auto rtView = info.registry->view<TransformComponent, MeshComponent, MaterialComponent>();
         for (auto e : rtView) {
             // LOD0 mesh is what we trace against (shadow rays don't need LOD).
@@ -646,14 +830,18 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
             d.blasAddress         = m.rt.deviceAddress;
             d.material.color      = mat.color;
             d.material.params     = glm::vec4(mat.metallic, mat.roughness, 0.0f, 0.0f);
-            d.material.vertexAddr = splitAddress(
-                getBufferDeviceAddress(device, m.vertexBuffer.buffer));
-            d.material.indexAddr  = splitAddress(
-                getBufferDeviceAddress(device, m.indexBuffer.buffer));
+            // Use the cached addresses populated at mesh upload time —
+            // calling vkGetBufferDeviceAddress here was ~1.7 ms / frame at
+            // 1.9k entities (two API calls per entity).
+            d.material.vertexAddr = splitAddress(m.vertexAddress);
+            d.material.indexAddr  = splitAddress(m.indexAddress);
             rtInstances.push_back(d);
         }
+        } // TLAS instance gather scope
 
+        if (info.profiler) info.profiler->gpuBegin(cmd, "TLAS build");
         buildTlas(*info.rtScene, frame, info.physicalDevice, device, cmd, rtInstances);
+        if (info.profiler) info.profiler->gpuEnd(cmd);
 
         // Point this frame's scene descriptor at the freshly built TLAS so
         // mesh.frag's ray queries see it. The TLAS handle is stable across
@@ -666,9 +854,9 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
     }
 
     info.cullParams->numCandidates = build.numCandidates;
-    if (build.numCandidates > 0) {
-        dispatchCull(cmd, *info.gpuCull, frame, *info.cullParams);
+    const bool runCull = build.numCandidates > 0;
 
+    auto cullToDrawBarrier = [&]() {
         VkMemoryBarrier mb{};
         mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -678,32 +866,49 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
             0, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+
+    // ── Pass 0 cull (frustum + prev-frame HZB) ────────────────────────────
+    if (runCull) {
+        if (info.profiler) info.profiler->gpuBegin(cmd, "Cull pass 0");
+        dispatchCull(cmd, *info.gpuCull, frame, *info.cullParams, 0u);
+        if (info.profiler) info.profiler->gpuEnd(cmd);
+        cullToDrawBarrier();
     }
 
-    // Skip the CSM pass entirely when RT shadows are doing the work — the
-    // fragment shader's CSM branch is dead in that case, so the maps would
-    // just be expensive scratch.
+    // ── Shadow pass (single-pass, uses pass-0's shadow instance writes) ────
     const bool rtShadowsActive = RT_SUPPORTED && info.rtSettings
                               && info.rtSettings->enabled && info.rtSettings->shadows;
     if (!rtShadowsActive) {
+        if (info.profiler) info.profiler->gpuBegin(cmd, "Shadow pass (CSM)");
         recordShadowPass(cmd, *info.shadow, info.shadowPipeline, info.shadowLayout,
                          *info.cascadeUbo, build.batches, shadowInstBuf, indirectBuf,
-                         *info.resources);
+                         *info.resources, info, frame);
+        if (info.profiler) info.profiler->gpuEnd(cmd);
     }
 
+    // ── Main pass A (CLEAR + sky + skinned) ───────────────────────────────
+    if (info.profiler) info.profiler->gpuBegin(cmd, "Main pass A");
     recordMainPass(cmd, *info.offscreen, info.mainPipeline, info.mainLayout,
                    info.descriptors->sceneSets[frame],
                    build.batches, mainInstBuf, indirectBuf, *info.resources,
-                   info.settings->vrsMode);
+                   info.settings->vrsMode, /*latePass=*/false);
     recordSkinnedDraws(cmd, info, frame);
+    // Sky in pass A: writes color where depth==1.0. Pass-B geometry may
+    // overwrite some of those pixels with newly-visible surfaces — which is
+    // exactly the correct behavior (geometry hides the sky behind it).
+    if (info.sky && info.sky->pipeline) {
+        recordSkyPass(cmd, *info.sky, info.descriptors->sceneSets[frame],
+                      info.offscreen->extent);
+    }
     vkCmdEndRenderPass(cmd);
+    if (info.profiler) info.profiler->gpuEnd(cmd);
 
-    // ── HZB reduction (for NEXT frame's occlusion cull) ────────────────────
-    // The render-pass external dependency already transitions the depth
-    // attachment to DEPTH_STENCIL_READ_ONLY_OPTIMAL and makes it visible to
-    // FRAGMENT_SHADER reads (for SSAO). Add a barrier so COMPUTE_SHADER reads
-    // can see the depth write too.
-    if (info.hzb) {
+    // ── HZB reduce + pass-1 cull + main pass B ────────────────────────────
+    // Renderpass A's external dependency already transitioned depth →
+    // DEPTH_STENCIL_READ_ONLY_OPTIMAL and made it visible to FRAGMENT_SHADER.
+    // Add a barrier so COMPUTE_SHADER reads see the depth write too.
+    if (info.hzb && runCull) {
         VkMemoryBarrier depthBarrier{};
         depthBarrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         depthBarrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
@@ -713,27 +918,65 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &depthBarrier, 0, nullptr, 0, nullptr);
 
+        if (info.profiler) info.profiler->gpuBegin(cmd, "HZB reduce (mid)");
         recordHzbReduce(cmd, *info.hzb);
+        if (info.profiler) info.profiler->gpuEnd(cmd);
+
+        // HZB-reduce's writes must be visible to pass-1 cull's reads.
+        VkMemoryBarrier hzbToCull{};
+        hzbToCull.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        hzbToCull.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        hzbToCull.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &hzbToCull, 0, nullptr, 0, nullptr);
+
+        // Pass-1 cull: re-tests culled candidates against the fresh HZB. The
+        // mid-frame view-proj is identical to what pass-0 saw, so we pass the
+        // same CullParamsUBO contents (dispatchCull skips the re-upload when
+        // pass != 0).
+        if (info.profiler) info.profiler->gpuBegin(cmd, "Cull pass 1");
+        dispatchCull(cmd, *info.gpuCull, frame, *info.cullParams, 1u);
+        if (info.profiler) info.profiler->gpuEnd(cmd);
+        cullToDrawBarrier();
+
+        if (info.profiler) info.profiler->gpuBegin(cmd, "Main pass B");
+        recordMainPass(cmd, *info.offscreen, info.mainPipeline, info.mainLayout,
+                       info.descriptors->sceneSets[frame],
+                       build.batches, mainInstBuf, indirectBuf, *info.resources,
+                       info.settings->vrsMode, /*latePass=*/true);
+        vkCmdEndRenderPass(cmd);
+        if (info.profiler) info.profiler->gpuEnd(cmd);
     }
 
 
     // SSAO uses the offscreen depth.
+    if (info.profiler) info.profiler->gpuBegin(cmd, "SSAO");
     recordSSAO(cmd, *info.ssao, *info.postfx, frame);
+    if (info.profiler) info.profiler->gpuEnd(cmd);
 
     // Bloom reads from offscreen HDR color.
+    if (info.profiler) info.profiler->gpuBegin(cmd, "Bloom");
     recordBloom(cmd, *info.bloom, *info.postfx, *info.settings);
+    if (info.profiler) info.profiler->gpuEnd(cmd);
 
     // Composite reads offscreen (HDR) + bloom + SSAO, writes LDR.
+    if (info.profiler) info.profiler->gpuBegin(cmd, "Composite");
     recordCompositePass(cmd, *info.ldr,
                         info.postfx->composite, info.postfx->compositeLayout,
                         info.composite->descriptorSets[frame]);
+    if (info.profiler) info.profiler->gpuEnd(cmd);
 
     // FXAA: LDR → swapchain.
+    if (info.profiler) info.profiler->gpuBegin(cmd, "FXAA + UI");
     recordFxaaPass(cmd, swapchain, *info.ldr,
                    info.postfx->fxaa, info.postfx->fxaaLayout,
                    info.ldr->descriptorSet, imageIndex, info.settings->fxaaEnabled);
+    if (info.profiler) info.profiler->gpuEnd(cmd);
 
     VK_CHECK(vkEndCommandBuffer(cmd));
+    if (info.profiler) info.profiler->endFrame();
 
     VkSemaphore waitSemaphores[]      = { swapchain.imageAvailableSemaphores[frame] };
     VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
@@ -765,6 +1008,23 @@ bool drawFrame(RendererData& renderer, SwapchainData& swapchain,
         return true;
     } else if (result != VK_SUCCESS) {
         throw std::runtime_error("Failed to present swapchain image");
+    }
+
+    // Snapshot this frame's per-entity world matrices for next frame's motion
+    // vectors. Done at the end so an aborted frame (early return above) won't
+    // corrupt the cache. Stale entries for destroyed entities are pruned in
+    // one pass — cheap relative to the ECS iteration cost of the frame.
+    if (info.prevTransforms) {
+        auto& cache = *info.prevTransforms;
+        auto& reg   = *info.registry;
+        for (auto it = cache.begin(); it != cache.end(); ) {
+            if (!reg.valid(it->first)) it = cache.erase(it);
+            else ++it;
+        }
+        auto view = reg.view<TransformComponent, MeshComponent, MaterialComponent>();
+        for (auto e : view) {
+            cache[e] = view.get<TransformComponent>(e).getMatrix();
+        }
     }
 
     renderer.currentFrame = (frame + 1) % MAX_FRAMES_IN_FLIGHT;

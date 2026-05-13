@@ -1,0 +1,111 @@
+#version 450
+
+// Pre-filter the environment for split-sum specular IBL. For each destination
+// mip-level + face + texel, importance-sample a GGX lobe around the surface
+// normal (taken to be the cubemap direction, R = V = N approximation), and
+// average the radiance. One dispatch per (mip, face) — push constant carries
+// roughness and the mip's face size.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    float roughness;
+    uint  faceSize;        // size of THIS mip's face (in texels)
+    uint  envFaceSize;     // base mip face size of envCube (for LOD biasing)
+    uint  sampleCount;     // 512..2048 in practice
+} pc;
+
+layout(set = 0, binding = 0, rgba16f) writeonly uniform imageCube prefilterCube;
+layout(set = 0, binding = 1)          uniform samplerCube         envCube;
+
+const float PI = 3.14159265359;
+
+vec3 dirFromCubeFace(uint face, vec2 uv) {
+    vec2 t = uv * 2.0 - 1.0;
+    vec3 d;
+    switch (face) {
+        case 0u: d = vec3( 1.0, -t.y, -t.x); break;
+        case 1u: d = vec3(-1.0, -t.y,  t.x); break;
+        case 2u: d = vec3( t.x,  1.0,  t.y); break;
+        case 3u: d = vec3( t.x, -1.0, -t.y); break;
+        case 4u: d = vec3( t.x, -t.y,  1.0); break;
+        default: d = vec3(-t.x, -t.y, -1.0); break;
+    }
+    return normalize(d);
+}
+
+// Hammersley low-discrepancy sequence (van der Corput radical inverse).
+float radicalInverseVdC(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+vec2 hammersley(uint i, uint N) {
+    return vec2(float(i) / float(N), radicalInverseVdC(i));
+}
+
+// Sample the GGX distribution: returns the half-vector in tangent space.
+vec3 importanceSampleGGX(vec2 Xi, float roughness, vec3 N) {
+    float a = roughness * roughness;
+    float phi      = 2.0 * PI * Xi.x;
+    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a*a - 1.0) * Xi.y));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    vec3 H = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    // Tangent → world: build a basis around N.
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T  = normalize(cross(up, N));
+    vec3 B  = cross(N, T);
+    return normalize(T * H.x + B * H.y + N * H.z);
+}
+
+float D_GGX(float NoH, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float d = (NoH * NoH) * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
+}
+
+void main() {
+    uvec2 xy   = gl_GlobalInvocationID.xy;
+    uint  face = gl_GlobalInvocationID.z;
+    if (xy.x >= pc.faceSize || xy.y >= pc.faceSize || face >= 6u) return;
+
+    vec2 uv = (vec2(xy) + 0.5) / float(pc.faceSize);
+    vec3 N  = dirFromCubeFace(face, uv);
+    vec3 R = N, V = N;
+
+    float totalWeight = 0.0;
+    vec3  prefiltered = vec3(0.0);
+    uint  N_SAMPLES   = pc.sampleCount;
+    float envSize     = float(pc.envFaceSize);
+
+    for (uint i = 0u; i < N_SAMPLES; ++i) {
+        vec2 Xi  = hammersley(i, N_SAMPLES);
+        vec3 H   = importanceSampleGGX(Xi, pc.roughness, N);
+        vec3 L   = normalize(2.0 * dot(V, H) * H - V);
+
+        float NoL = max(dot(N, L), 0.0);
+        if (NoL > 0.0) {
+            // Mip-level selection (Krivanek/Colbert) to reduce shimmering.
+            // pdf = D(H) * NoH / (4 * VoH). Solid-angle-per-sample ratio drives
+            // the LOD bias.
+            float NoH = max(dot(N, H), 0.0);
+            float VoH = max(dot(V, H), 0.0);
+            float D   = D_GGX(NoH, pc.roughness);
+            float pdf = (D * NoH / max(4.0 * VoH, 0.0001)) + 0.0001;
+            float saTexel  = 4.0 * PI / (6.0 * envSize * envSize);
+            float saSample = 1.0 / (float(N_SAMPLES) * pdf);
+            float mipBias  = pc.roughness == 0.0 ? 0.0
+                           : 0.5 * log2(saSample / saTexel);
+            prefiltered += textureLod(envCube, L, mipBias).rgb * NoL;
+            totalWeight += NoL;
+        }
+    }
+    prefiltered /= max(totalWeight, 1e-4);
+    imageStore(prefilterCube, ivec3(int(xy.x), int(xy.y), int(face)),
+               vec4(prefiltered, 1.0));
+}

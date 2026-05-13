@@ -1,14 +1,15 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
+#include <vk_mem_alloc.h>
 #include <string>
 
 struct TextureData {
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkImageView imageView = VK_NULL_HANDLE;
-    VkSampler sampler = VK_NULL_HANDLE;
-    uint32_t mipLevels = 1;
+    VkImage       image      = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    VkImageView   imageView  = VK_NULL_HANDLE;
+    VkSampler     sampler    = VK_NULL_HANDLE;
+    uint32_t      mipLevels  = 1;
 };
 
 TextureData createTextureFromFile(VkPhysicalDevice physicalDevice, VkDevice device,

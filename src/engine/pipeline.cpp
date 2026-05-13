@@ -358,11 +358,11 @@ PipelineData createSkinnedPipeline(VkDevice device, VkRenderPass renderPass, VkE
     dynState.dynamicStateCount = 2;
     dynState.pDynamicStates    = dyn;
 
-    // Push constants: model + colorTint + matParams (in vertex stage; frag reads via interpolant)
+    // Push constants: model + colorTint + matParams + matParams2 (vertex stage)
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pcr.offset     = 0;
-    pcr.size       = sizeof(glm::mat4) + sizeof(glm::vec4) * 2; // 96
+    pcr.size       = sizeof(glm::mat4) + sizeof(glm::vec4) * 3; // 112
 
     VkDescriptorSetLayout setLayouts[] = { sceneSetLayout, materialSetLayout, boneSetLayout };
 
@@ -397,5 +397,108 @@ PipelineData createSkinnedPipeline(VkDevice device, VkRenderPass renderPass, VkE
     vkDestroyShaderModule(device, vertModule, nullptr);
 
     std::cout << "[VulkanEngine] Skinned pipeline created\n";
+    return result;
+}
+
+// ── Skinned shadow pipeline (depth-only) ────────────────────────────────────
+
+PipelineData createSkinnedShadowPipeline(VkDevice device, VkRenderPass shadowRenderPass,
+                                         uint32_t shadowMapSize,
+                                         VkDescriptorSetLayout boneSetLayout,
+                                         const std::string& vertPath)
+{
+    PipelineData result;
+    auto vertModule = loadShaderModule(device, vertPath);
+
+    VkPipelineShaderStageCreateInfo vertStage{};
+    vertStage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vertStage.stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    vertStage.module = vertModule;
+    vertStage.pName  = "main";
+
+    auto binding = getSkinnedVertexBinding();
+    auto attrs   = getSkinnedVertexAttributes();
+
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInput.vertexBindingDescriptionCount   = 1;
+    vertexInput.pVertexBindingDescriptions      = &binding;
+    vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
+    vertexInput.pVertexAttributeDescriptions    = attrs.data();
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport viewport{};
+    viewport.width    = static_cast<float>(shadowMapSize);
+    viewport.height   = static_cast<float>(shadowMapSize);
+    viewport.minDepth = 0.0f; viewport.maxDepth = 1.0f;
+    VkRect2D scissor{}; scissor.extent = { shadowMapSize, shadowMapSize };
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1; vp.pViewports = &viewport;
+    vp.scissorCount  = 1; vp.pScissors  = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode             = VK_POLYGON_MODE_FILL;
+    rs.lineWidth               = 1.0f;
+    rs.cullMode                = VK_CULL_MODE_FRONT_BIT;     // matches static shadow pipeline
+    rs.frontFace               = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.depthBiasEnable         = VK_TRUE;
+    rs.depthBiasConstantFactor = 1.25f;
+    rs.depthBiasSlopeFactor    = 1.75f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable  = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS;
+
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 0;
+
+    // lightViewProj + model = 128 B. Vulkan guarantees ≥128 B push range.
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcr.offset     = 0;
+    pcr.size       = sizeof(glm::mat4) * 2;
+
+    VkDescriptorSetLayout setLayouts[] = { boneSetLayout };
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount         = 1;
+    layoutInfo.pSetLayouts            = setLayouts;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges    = &pcr;
+    VK_CHECK(vkCreatePipelineLayout(device, &layoutInfo, nullptr, &result.pipelineLayout));
+
+    VkGraphicsPipelineCreateInfo info{};
+    info.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    info.stageCount          = 1;
+    info.pStages             = &vertStage;
+    info.pVertexInputState   = &vertexInput;
+    info.pInputAssemblyState = &ia;
+    info.pViewportState      = &vp;
+    info.pRasterizationState = &rs;
+    info.pMultisampleState   = &ms;
+    info.pDepthStencilState  = &ds;
+    info.pColorBlendState    = &cb;
+    info.layout              = result.pipelineLayout;
+    info.renderPass          = shadowRenderPass;
+    info.subpass             = 0;
+
+    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr,
+                                       &result.graphicsPipeline));
+    vkDestroyShaderModule(device, vertModule, nullptr);
+
+    std::cout << "[VulkanEngine] Skinned shadow pipeline created\n";
     return result;
 }

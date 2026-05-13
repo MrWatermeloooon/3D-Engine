@@ -141,10 +141,7 @@ void uploadSkinnedMesh(SkinnedMesh& mesh, VkPhysicalDevice physicalDevice, VkDev
     auto staging = createBuffer(physicalDevice, device, vbSize,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    void* data;
-    vkMapMemory(device, staging.memory, 0, vbSize, 0, &data);
-    std::memcpy(data, mesh.vertices.data(), vbSize);
-    vkUnmapMemory(device, staging.memory);
+    std::memcpy(staging.mapped, mesh.vertices.data(), vbSize);
 
     mesh.vertexBuffer = createBuffer(physicalDevice, device, vbSize,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -157,9 +154,7 @@ void uploadSkinnedMesh(SkinnedMesh& mesh, VkPhysicalDevice physicalDevice, VkDev
     staging = createBuffer(physicalDevice, device, ibSize,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    vkMapMemory(device, staging.memory, 0, ibSize, 0, &data);
-    std::memcpy(data, mesh.indices.data(), ibSize);
-    vkUnmapMemory(device, staging.memory);
+    std::memcpy(staging.mapped, mesh.indices.data(), ibSize);
 
     mesh.indexBuffer = createBuffer(physicalDevice, device, ibSize,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,

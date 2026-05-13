@@ -1,5 +1,6 @@
 #include "depth.h"
 #include "buffer.h"
+#include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
 #include <stdexcept>
@@ -43,8 +44,8 @@ DepthData createDepthResources(VkPhysicalDevice physicalDevice, VkDevice device,
                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-    depth.image  = img.image;
-    depth.memory = img.memory;
+    depth.image      = img.image;
+    depth.allocation = img.allocation;
     depth.imageView = createImageView(device, depth.image, depth.format,
                                       VK_IMAGE_ASPECT_DEPTH_BIT, 1);
     return depth;
@@ -56,9 +57,8 @@ void destroyDepthResources(VkDevice device, DepthData& depth) {
         depth.imageView = VK_NULL_HANDLE;
     }
     if (depth.image != VK_NULL_HANDLE) {
-        vkDestroyImage(device, depth.image, nullptr);
-        vkFreeMemory(device, depth.memory, nullptr);
-        depth.image  = VK_NULL_HANDLE;
-        depth.memory = VK_NULL_HANDLE;
+        vmaDestroyImage(gVmaAllocator, depth.image, depth.allocation);
+        depth.image      = VK_NULL_HANDLE;
+        depth.allocation = VK_NULL_HANDLE;
     }
 }

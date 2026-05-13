@@ -3,6 +3,7 @@
 
 #include "texture.h"
 #include "buffer.h"
+#include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
 #include <stdexcept>
@@ -100,10 +101,9 @@ static TextureData createTextureFromPixels(VkPhysicalDevice physicalDevice, VkDe
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    void* data;
-    vkMapMemory(device, staging.memory, 0, imageSize, 0, &data);
-    memcpy(data, pixels, static_cast<size_t>(imageSize));
-    vkUnmapMemory(device, staging.memory);
+    // VMA persistently maps host-visible allocations; read the pointer from
+    // the AllocatedBuffer's `mapped` field.
+    memcpy(staging.mapped, pixels, static_cast<size_t>(imageSize));
 
     auto img = createImage(physicalDevice, device,
         static_cast<uint32_t>(width), static_cast<uint32_t>(height), tex.mipLevels,
@@ -111,8 +111,8 @@ static TextureData createTextureFromPixels(VkPhysicalDevice physicalDevice, VkDe
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
         VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    tex.image  = img.image;
-    tex.memory = img.memory;
+    tex.image      = img.image;
+    tex.allocation = img.allocation;
 
     transitionImageLayout(device, commandPool, queue, tex.image,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, tex.mipLevels);
@@ -189,7 +189,6 @@ TextureData createDefaultTexture(VkPhysicalDevice physicalDevice, VkDevice devic
 void destroyTexture(VkDevice device, TextureData& tex) {
     if (tex.sampler   != VK_NULL_HANDLE) vkDestroySampler(device, tex.sampler, nullptr);
     if (tex.imageView != VK_NULL_HANDLE) vkDestroyImageView(device, tex.imageView, nullptr);
-    if (tex.image     != VK_NULL_HANDLE) vkDestroyImage(device, tex.image, nullptr);
-    if (tex.memory    != VK_NULL_HANDLE) vkFreeMemory(device, tex.memory, nullptr);
+    if (tex.image     != VK_NULL_HANDLE) vmaDestroyImage(gVmaAllocator, tex.image, tex.allocation);
     tex = {};
 }

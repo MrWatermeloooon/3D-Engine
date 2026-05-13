@@ -182,11 +182,9 @@ void buildTlas(RtScene& scene, uint32_t frame,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
     if (count > 0) {
-        void* dst = nullptr;
-        vkMapMemory(device, scene.instanceBuffer[frame].memory, 0, recordBytes, 0, &dst);
-        std::memcpy(dst, records.data(),
+        std::memcpy(scene.instanceBuffer[frame].mapped, records.data(),
                     sizeof(VkAccelerationStructureInstanceKHR) * count);
-        vkUnmapMemory(device, scene.instanceBuffer[frame].memory);
+        (void)recordBytes;
     }
 
     // ── Upload parallel material buffer (host-visible) ────────────────────
@@ -199,11 +197,9 @@ void buildTlas(RtScene& scene, uint32_t frame,
                | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (count > 0) {
-        void* dst = nullptr;
-        vkMapMemory(device, scene.materialBuffer[frame].memory, 0, matBytes, 0, &dst);
-        std::memcpy(dst, materials.data(),
+        std::memcpy(scene.materialBuffer[frame].mapped, materials.data(),
                     sizeof(RtInstanceMaterial) * count);
-        vkUnmapMemory(device, scene.materialBuffer[frame].memory);
+        (void)matBytes;
     }
 
     // ── Geometry pointing at the instance buffer ──────────────────────────

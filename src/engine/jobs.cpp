@@ -38,26 +38,6 @@ void JobSystem::wait_all() {
     });
 }
 
-void JobSystem::parallel_for(size_t count, std::function<void(size_t)> fn) {
-    if (count == 0) return;
-    if (m_workers.empty()) {
-        for (size_t i = 0; i < count; ++i) fn(i);
-        return;
-    }
-    // Split into ~one chunk per worker. Each chunk runs `fn` for its index range.
-    size_t chunks = std::min<size_t>(count, m_workers.size());
-    size_t per    = (count + chunks - 1) / chunks;
-    for (size_t c = 0; c < chunks; ++c) {
-        size_t begin = c * per;
-        size_t end   = std::min(begin + per, count);
-        if (begin >= end) continue;
-        enqueue([begin, end, fn]() {
-            for (size_t i = begin; i < end; ++i) fn(i);
-        });
-    }
-    wait_all();
-}
-
 void JobSystem::workerLoop() {
     while (true) {
         std::function<void()> task;

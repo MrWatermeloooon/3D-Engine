@@ -1,0 +1,74 @@
+#version 450
+
+// Convolve the environment cubemap into a diffuse-irradiance cubemap. For each
+// destination texel (face, uv → world normal N) integrate
+//     ∫_Ω L(ω) · max(N·ω, 0) dω
+// across the upper hemisphere around N. We use phi/theta uniform sampling
+// (cheap, low samples per texel for the small destination). 32×32 × 6 faces
+// at 1.8k samples/texel ≈ ~35 ms one-shot on a 5070 Ti.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint  faceSize;
+    float sampleDelta;   // step size in radians; smaller = more samples
+    float pad0, pad1;
+} pc;
+
+layout(set = 0, binding = 0, rgba16f) writeonly uniform imageCube irradianceCube;
+layout(set = 0, binding = 1)          uniform samplerCube         envCube;
+
+const float PI = 3.14159265359;
+
+vec3 dirFromCubeFace(uint face, vec2 uv) {
+    vec2 t = uv * 2.0 - 1.0;
+    vec3 d;
+    switch (face) {
+        case 0u: d = vec3( 1.0, -t.y, -t.x); break;
+        case 1u: d = vec3(-1.0, -t.y,  t.x); break;
+        case 2u: d = vec3( t.x,  1.0,  t.y); break;
+        case 3u: d = vec3( t.x, -1.0, -t.y); break;
+        case 4u: d = vec3( t.x, -t.y,  1.0); break;
+        default: d = vec3(-t.x, -t.y, -1.0); break;
+    }
+    return normalize(d);
+}
+
+void main() {
+    uvec2 xy   = gl_GlobalInvocationID.xy;
+    uint  face = gl_GlobalInvocationID.z;
+    if (xy.x >= pc.faceSize || xy.y >= pc.faceSize || face >= 6u) return;
+
+    vec2 uv  = (vec2(xy) + 0.5) / float(pc.faceSize);
+    vec3 N   = dirFromCubeFace(face, uv);
+
+    // Build an orthonormal basis around N (Frisvad's method).
+    float sign_ = N.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (sign_ + N.z);
+    float bx = N.x * N.y * a;
+    vec3 right   = vec3(1.0 + sign_ * N.x * N.x * a, sign_ * bx, -sign_ * N.x);
+    vec3 forward = vec3(bx, sign_ + N.y * N.y * a, -N.y);
+
+    vec3  irradiance = vec3(0.0);
+    float samples    = 0.0;
+    for (float phi = 0.0; phi < 2.0 * PI; phi += pc.sampleDelta) {
+        for (float theta = 0.0; theta < 0.5 * PI; theta += pc.sampleDelta) {
+            // Spherical → cartesian in tangent space, then rotate to world.
+            float sinT = sin(theta);
+            float cosT = cos(theta);
+            vec3 tangentSample = vec3(sinT * cos(phi), sinT * sin(phi), cosT);
+            vec3 worldSample   = tangentSample.x * right
+                               + tangentSample.y * forward
+                               + tangentSample.z * N;
+            // Lambertian weighting (cosT) already baked into the analytical
+            // factor below; the diffuse irradiance integral is
+            //   π · (1/N) Σ L(ω) cosT sinT  /  (Σ sinT)? — we use the standard
+            // closed-form normalization: π · mean(L · cosT).
+            irradiance += textureLod(envCube, worldSample, 0.0).rgb * cosT * sinT;
+            samples    += 1.0;
+        }
+    }
+    irradiance = PI * irradiance / samples;
+    imageStore(irradianceCube, ivec3(int(xy.x), int(xy.y), int(face)),
+               vec4(irradiance, 1.0));
+}

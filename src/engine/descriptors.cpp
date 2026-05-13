@@ -15,8 +15,11 @@ VkDescriptorSetLayout createSceneSetLayout(VkDevice device) {
     // RT-unsupported devices we skip them, fall back to CSM exclusively, and
     // the validation layer is happy because the shader never executes the
     // gated branches.
-    const uint32_t bindingCount = RT_SUPPORTED ? 6u : 4u;
-    std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+    // Bindings 6/7/8 = IBL (irradiance cube, prefilter cube, BRDF LUT). Always
+    // present so mesh.frag's IBL declarations match the layout regardless of
+    // RT_SUPPORTED.
+    const uint32_t bindingCount = RT_SUPPORTED ? 9u : 7u;
+    std::array<VkDescriptorSetLayoutBinding, 9> bindings{};
 
     // Binding 0: scene UBO (view, proj, cameraPos, rtParams)
     bindings[0].binding         = 0;
@@ -42,19 +45,38 @@ VkDescriptorSetLayout createSceneSetLayout(VkDevice device) {
     bindings[3].descriptorCount = 1;
     bindings[3].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+    uint32_t slot = 4;
     if (RT_SUPPORTED) {
         // Binding 4: TLAS for ray-queried shadows / reflections / GI.
-        bindings[4].binding         = 4;
-        bindings[4].descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-        bindings[4].descriptorCount = 1;
-        bindings[4].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings[slot].binding         = 4;
+        bindings[slot].descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        bindings[slot].descriptorCount = 1;
+        bindings[slot].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        ++slot;
         // Binding 5: per-instance shading materials (indexed by
         // gl_RayQueryInstanceCustomIndexEXT in the hit handler).
-        bindings[5].binding         = 5;
-        bindings[5].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[5].descriptorCount = 1;
-        bindings[5].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings[slot].binding         = 5;
+        bindings[slot].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[slot].descriptorCount = 1;
+        bindings[slot].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        ++slot;
     }
+    // IBL bindings — always present so the shader declarations are valid
+    // regardless of RT support. Backed by the IBL bake's images/samplers.
+    bindings[slot].binding         = 6;  // irradiance cubemap
+    bindings[slot].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[slot].descriptorCount = 1;
+    bindings[slot].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    ++slot;
+    bindings[slot].binding         = 7;  // prefiltered specular cubemap
+    bindings[slot].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[slot].descriptorCount = 1;
+    bindings[slot].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    ++slot;
+    bindings[slot].binding         = 8;  // split-sum BRDF LUT
+    bindings[slot].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[slot].descriptorCount = 1;
+    bindings[slot].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -109,8 +131,8 @@ void createUniformBuffers(DescriptorData& data, VkPhysicalDevice physicalDevice,
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-        vkMapMemory(device, data.uniformBuffers[i].memory, 0, bufferSize, 0,
-                    &data.uniformBuffersMapped[i]);
+        data.uniformBuffersMapped[i] = data.uniformBuffers[i].mapped;
+        (void)bufferSize;
     }
 }
 
@@ -120,8 +142,8 @@ void createDescriptorPool(DescriptorData& data, VkDevice device,
     std::vector<VkDescriptorPoolSize> poolSizes = {
         // Scene UBO + lights UBO + cascade UBO + bone UBO per frame
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         framesInFlight * 4 },
-        // Shadow map per frame + entire bindless texture array (allocated once)
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, framesInFlight + BINDLESS_MAX_TEXTURES },
+        // Shadow map + 3 IBL samplers per frame, + entire bindless array (once)
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, framesInFlight * 4 + BINDLESS_MAX_TEXTURES },
     };
     if (RT_SUPPORTED) {
         poolSizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
@@ -263,6 +285,40 @@ void writeSceneTlas(DescriptorData& data, VkDevice device, uint32_t frame,
     w.descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     w.descriptorCount = 1;
     vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
+}
+
+void writeSceneIbl(DescriptorData& data, VkDevice device, uint32_t frame,
+                   VkImageView irradianceView, VkImageView prefilterView,
+                   VkImageView brdfLutView,
+                   VkSampler cubeSampler, VkSampler lutSampler)
+{
+    VkDescriptorImageInfo irr{};
+    irr.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    irr.imageView   = irradianceView;
+    irr.sampler     = cubeSampler;
+
+    VkDescriptorImageInfo pre{};
+    pre.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    pre.imageView   = prefilterView;
+    pre.sampler     = cubeSampler;
+
+    VkDescriptorImageInfo lut{};
+    lut.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    lut.imageView   = brdfLutView;
+    lut.sampler     = lutSampler;
+
+    std::array<VkWriteDescriptorSet, 3> w{};
+    for (auto& wi : w) wi.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = data.sceneSets[frame]; w[0].dstBinding = 6;
+    w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[0].pImageInfo = &irr;
+    w[1].dstSet = data.sceneSets[frame]; w[1].dstBinding = 7;
+    w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[1].pImageInfo = &pre;
+    w[2].dstSet = data.sceneSets[frame]; w[2].dstBinding = 8;
+    w[2].descriptorCount = 1; w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[2].pImageInfo = &lut;
+    vkUpdateDescriptorSets(device, 3, w.data(), 0, nullptr);
 }
 
 void writeSceneRtMaterials(DescriptorData& data, VkDevice device, uint32_t frame,

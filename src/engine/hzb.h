@@ -20,6 +20,15 @@
 // The HZB lives in VK_IMAGE_LAYOUT_GENERAL throughout — it's both written as
 // a storage image (per-mip image2D) during reduction and sampled as a combined
 // image sampler during cull. Avoids per-mip layout transitions.
+//
+// NOTE: GENERAL disables some driver read-only optimisations that
+// SHADER_READ_ONLY_OPTIMAL would enable. In *this* engine the HZB is only
+// ever read by compute shaders (reduce + cull), never by fragment / vertex
+// stages, so the practical win from a SHADER_READ_ONLY_OPTIMAL transition
+// would be marginal on most drivers. If the HZB ever gets sampled from a
+// fragment shader (e.g. a soft-particle pass), revisit: transition each mip
+// to SHADER_READ_ONLY_OPTIMAL after its write barrier in recordHzbReduce(),
+// and update gpu_cull's descriptor write to declare the same layout.
 
 struct HzbData {
     AllocatedImage              image;

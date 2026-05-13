@@ -1,4 +1,5 @@
 #include "shadow.h"
+#include "vulkan_init.h"
 #include "../utils/vk_check.h"
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -7,6 +8,7 @@
 #include <limits>
 
 static void createShadowImage(ShadowData& s, VkPhysicalDevice physicalDevice, VkDevice device) {
+    (void)physicalDevice;
     VkImageCreateInfo info{};
     info.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     info.imageType     = VK_IMAGE_TYPE_2D;
@@ -20,18 +22,9 @@ static void createShadowImage(ShadowData& s, VkPhysicalDevice physicalDevice, Vk
     info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    VK_CHECK(vkCreateImage(device, &info, nullptr, &s.image));
-
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(device, s.image, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize  = req.size;
-    alloc.memoryTypeIndex = findMemoryType(physicalDevice, req.memoryTypeBits,
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(device, &alloc, nullptr, &s.memory));
-    VK_CHECK(vkBindImageMemory(device, s.image, s.memory, 0));
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VK_CHECK(vmaCreateImage(gVmaAllocator, &info, &aci, &s.image, &s.allocation, nullptr));
 
     // Array view (sampled in main pass)
     VkImageViewCreateInfo viewInfo{};
@@ -145,7 +138,8 @@ static void createCascadeBuffers(ShadowData& s, VkPhysicalDevice physicalDevice,
         s.cascadeBuffers[i] = createBuffer(physicalDevice, device, size,
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkMapMemory(device, s.cascadeBuffers[i].memory, 0, size, 0, &s.cascadeMapped[i]);
+        s.cascadeMapped[i] = s.cascadeBuffers[i].mapped;
+        (void)size;
     }
 }
 
@@ -194,8 +188,7 @@ void destroyShadowResources(VkDevice device, ShadowData& shadow) {
     if (shadow.renderPass) vkDestroyRenderPass(device, shadow.renderPass, nullptr);
     for (auto v : shadow.layerViews) if (v) vkDestroyImageView(device, v, nullptr);
     if (shadow.arrayView)  vkDestroyImageView(device, shadow.arrayView, nullptr);
-    if (shadow.image)      vkDestroyImage(device, shadow.image, nullptr);
-    if (shadow.memory)     vkFreeMemory(device, shadow.memory, nullptr);
+    if (shadow.image)      vmaDestroyImage(gVmaAllocator, shadow.image, shadow.allocation);
 
     shadow = {};
 }

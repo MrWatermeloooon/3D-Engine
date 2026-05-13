@@ -10,36 +10,54 @@ VkVertexInputBindingDescription getInstanceBindingDescription() {
     return b;
 }
 
-std::array<VkVertexInputAttributeDescription, 9> getInstanceAttributeDescriptions() {
-    std::array<VkVertexInputAttributeDescription, 9> attrs{};
+std::array<VkVertexInputAttributeDescription, 14> getInstanceAttributeDescriptions() {
+    std::array<VkVertexInputAttributeDescription, 14> attrs{};
 
-    // mat4 model — 4 vec4 slots, locations 4..7
+    // Instance attribute locations start at 5 — vertex attribute locations
+    // are 0..4 (position, normal, texCoord, color, tangent).
+
+    // mat4 model — 4 vec4 slots, locations 5..8
     for (uint32_t i = 0; i < 4; ++i) {
         attrs[i].binding  = 1;
-        attrs[i].location = 4 + i;
+        attrs[i].location = 5 + i;
         attrs[i].format   = VK_FORMAT_R32G32B32A32_SFLOAT;
         attrs[i].offset   = static_cast<uint32_t>(offsetof(InstanceData, model) + i * sizeof(glm::vec4));
     }
-    // vec4 colorTint — location 8
+    // vec4 colorTint — location 9
     attrs[4].binding  = 1;
-    attrs[4].location = 8;
+    attrs[4].location = 9;
     attrs[4].format   = VK_FORMAT_R32G32B32A32_SFLOAT;
     attrs[4].offset   = offsetof(InstanceData, colorTint);
 
-    // vec4 matParams — location 9
+    // vec4 matParams — location 10
     attrs[5].binding  = 1;
-    attrs[5].location = 9;
+    attrs[5].location = 10;
     attrs[5].format   = VK_FORMAT_R32G32B32A32_SFLOAT;
     attrs[5].offset   = offsetof(InstanceData, matParams);
 
-    // Normal matrix columns — locations 10, 11, 12
+    // Normal matrix columns — locations 11, 12, 13
     for (uint32_t i = 0; i < 3; ++i) {
         attrs[6 + i].binding  = 1;
-        attrs[6 + i].location = 10 + i;
+        attrs[6 + i].location = 11 + i;
         attrs[6 + i].format   = VK_FORMAT_R32G32B32A32_SFLOAT;
         attrs[6 + i].offset   = static_cast<uint32_t>(
             offsetof(InstanceData, normalCol0) + i * sizeof(glm::vec4));
     }
+
+    // mat4 prevModel — locations 14..17
+    for (uint32_t i = 0; i < 4; ++i) {
+        attrs[9 + i].binding  = 1;
+        attrs[9 + i].location = 14 + i;
+        attrs[9 + i].format   = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attrs[9 + i].offset   = static_cast<uint32_t>(
+            offsetof(InstanceData, prevModel) + i * sizeof(glm::vec4));
+    }
+
+    // vec4 matParams2 — location 18 (parallax: heightSlot, scale, _, _)
+    attrs[13].binding  = 1;
+    attrs[13].location = 18;
+    attrs[13].format   = VK_FORMAT_R32G32B32A32_SFLOAT;
+    attrs[13].offset   = offsetof(InstanceData, matParams2);
 
     return attrs;
 }
@@ -56,7 +74,7 @@ void createInstanceBuffer(InstanceBuffer& b, VkPhysicalDevice physicalDevice,
         b.buffers[i] = createBuffer(physicalDevice, device, size,
             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkMapMemory(device, b.buffers[i].memory, 0, size, 0, &b.mapped[i]);
+        b.mapped[i] = b.buffers[i].mapped;
     }
 }
 
@@ -79,7 +97,7 @@ void createIndirectBuffer(IndirectBuffer& b, VkPhysicalDevice physicalDevice,
         b.buffers[i] = createBuffer(physicalDevice, device, size,
             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkMapMemory(device, b.buffers[i].memory, 0, size, 0, &b.mapped[i]);
+        b.mapped[i] = b.buffers[i].mapped;
     }
 }
 
@@ -102,7 +120,7 @@ void createCandidateBuffer(CandidateBuffer& b, VkPhysicalDevice physicalDevice,
         b.buffers[i] = createBuffer(physicalDevice, device, size,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkMapMemory(device, b.buffers[i].memory, 0, size, 0, &b.mapped[i]);
+        b.mapped[i] = b.buffers[i].mapped;
     }
 }
 
@@ -125,7 +143,7 @@ void createBatchHeaderBuffer(BatchHeaderBuffer& b, VkPhysicalDevice physicalDevi
         b.buffers[i] = createBuffer(physicalDevice, device, size,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkMapMemory(device, b.buffers[i].memory, 0, size, 0, &b.mapped[i]);
+        b.mapped[i] = b.buffers[i].mapped;
     }
 }
 
