@@ -134,7 +134,7 @@ After building, run the generated `VulkanEngine` executable from the build outpu
 
 ## Notes
 
-The repository intentionally ignores local build output, Visual Studio metadata, compiled SPIR-V files, and the Vulkan SDK installer. Install the Vulkan SDK locally instead of committing the installer into Git.
+The repository intentionally ignores local build output, Visual Studio metadata, compiled SPIR-V files, and the Vulkan SDK installer. Install the Vulkan SDK locally.
 
 If a Windows build fails with `LNK1168`, another program may be holding the executable open. Close capture/overlay tools such as Medal, OBS, or Overwolf, then rebuild.
 
