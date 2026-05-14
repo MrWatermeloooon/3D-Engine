@@ -11,3 +11,4 @@ cmake_install.cmake
 VulkanSDK-Installer.exe
 DLSS_SDK/
 dlss_logs/
+HANDOFF.md
