@@ -4,6 +4,8 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 
 > **Work in progress:** this engine is actively being developed. Some systems are experimental, APIs may change, and features listed in the roadmap are planned or partially implemented rather than production-ready.
 
+> **Solo learning project:** updates may be slow or uneven because this is being built by one developer while learning engine architecture, Vulkan, rendering techniques, and tooling along the way.
+
 ## Current Features
 
 - Vulkan renderer with swapchain, command buffers, descriptor management, and pipeline setup.
