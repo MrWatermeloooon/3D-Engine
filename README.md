@@ -153,7 +153,8 @@ If a Windows build fails with `LNK1168`, another program may be holding the exec
 
 ### RTX / Ray Tracing
 
-- DLSS or Streamline upscaling: revisit AI upscaling later using the existing motion-vector scaffold, preferably without a hard NGX SDK dependency.
+- NVIDIA Streamline integration for DLSS upscaling, using the existing motion-vector scaffold without a hard direct-NGX dependency.
+- Intel XeSS SDK integration as a vendor-neutral-ish upscaling path alongside DLSS.
 - Previous per-instance transforms for true object motion vectors instead of camera-only motion.
 - Denoising and temporal accumulation for cleaner ray-traced GI and glossy reflections.
 - Higher-quality RT reflection filtering for glossy materials.
