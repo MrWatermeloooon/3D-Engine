@@ -14,6 +14,10 @@ find_package(EnTT CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(imguizmo CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+find_package(Jolt CONFIG REQUIRED)
+find_package(OpenAL CONFIG REQUIRED)
+find_package(Lua REQUIRED)
+find_package(sol2 CONFIG REQUIRED)
 
 # ── Source files ──────────────────────────────────────────────
 set(SOURCES
@@ -49,6 +53,13 @@ set(SOURCES
     src/engine/spatial.cpp
     src/engine/ibl.cpp
     src/engine/gltf_loader.cpp
+    src/engine/physics.cpp
+    src/engine/audio.cpp
+    src/engine/scripting.cpp
+    src/engine/serialization.cpp
+    src/engine/undo.cpp
+    src/engine/material_graph.cpp
+    src/engine/asset_browser.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
@@ -79,7 +90,13 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     imgui::imgui
     imguizmo::imguizmo
     GPUOpen::VulkanMemoryAllocator
+    Jolt::Jolt
+    OpenAL::OpenAL
+    sol2::sol2
+    ${LUA_LIBRARIES}
 )
+
+target_include_directories(${PROJECT_NAME} PRIVATE ${LUA_INCLUDE_DIR})
 
 # ── Shader compilation (GLSL → SPIR-V) ───────────────────────
 find_program(GLSLC_EXECUTABLE glslc REQUIRED)

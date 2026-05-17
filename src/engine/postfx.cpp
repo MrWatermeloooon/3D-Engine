@@ -46,6 +46,26 @@ static VkSampler makeNoiseSampler(VkDevice device) {
     return out;
 }
 
+// Point-sampling clamp sampler for the depth target. Depth uses
+// VK_FORMAT_D32_SFLOAT, which on most desktop GPUs does NOT advertise
+// SAMPLED_IMAGE_FILTER_LINEAR; binding it to a LINEAR sampler is a
+// VUID-vkCmdDraw-magFilter-04553 violation and undefined sampling. Depth
+// reconstruction (SSAO, DoF, HZB mip-0) also wants point sampling, not a
+// bilinear blend across depth discontinuities.
+static VkSampler makeNearestClampSampler(VkDevice device) {
+    VkSamplerCreateInfo s{};
+    s.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    s.magFilter    = VK_FILTER_NEAREST;
+    s.minFilter    = VK_FILTER_NEAREST;
+    s.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    s.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    s.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    s.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VkSampler out;
+    VK_CHECK(vkCreateSampler(device, &s, nullptr, &out));
+    return out;
+}
+
 static VkRenderPass makeColorOnlyPass(VkDevice device, VkFormat fmt,
                                       VkAttachmentLoadOp loadOp,
                                       VkImageLayout initialLayout) {
@@ -248,7 +268,7 @@ void createOffscreenTarget(OffscreenTarget& t, VkPhysicalDevice physicalDevice, 
     VK_CHECK(vkCreateFramebuffer(device, &fb, nullptr, &t.framebuffer));
 
     t.sampler      = makeLinearClampSampler(device);
-    t.depthSampler = makeLinearClampSampler(device);
+    t.depthSampler = makeNearestClampSampler(device);
 }
 
 void destroyOffscreenTarget(VkDevice device, OffscreenTarget& t) {
@@ -386,35 +406,22 @@ static void uploadNoise(SSAOTarget& s, VkPhysicalDevice physicalDevice, VkDevice
                         VkCommandPool commandPool, VkQueue queue)
 {
     constexpr int N = 4;
-    constexpr VkFormat fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+    constexpr VkFormat fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
 
     std::mt19937 rng(0xC0FFEE);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    uint16_t noise[N * N * 4];
+    float pixels[N * N * 4];
     for (int i = 0; i < N * N; ++i) {
         glm::vec3 v(dist(rng), dist(rng), 0.0f);
-        v = glm::normalize(v);
-        // half-float storage: convert via glm::packHalf would be ideal; but here R16G16B16A16_SFLOAT
-        // requires actual half values. Use __builtin_convertvector? Cleanly: use vk format with float storage.
-        // Simpler: use R32G32B32A32_SFLOAT for the 4x4 noise — tiny memory cost, avoids half conversion.
-        (void)v;
-    }
-    // Switch to float32 noise — simpler, only 256 bytes
-    constexpr VkFormat fmt32 = VK_FORMAT_R32G32B32A32_SFLOAT;
-    float pixels[N * N * 4];
-    std::mt19937 rng2(0xC0FFEE);
-    std::uniform_real_distribution<float> dist2(-1.0f, 1.0f);
-    for (int i = 0; i < N * N; ++i) {
-        glm::vec3 v(dist2(rng2), dist2(rng2), 0.0f);
         v = glm::normalize(v);
         pixels[i*4+0] = v.x; pixels[i*4+1] = v.y; pixels[i*4+2] = v.z; pixels[i*4+3] = 0.0f;
     }
 
-    s.noiseImage = createImage(physicalDevice, device, N, N, 1, fmt32,
+    s.noiseImage = createImage(physicalDevice, device, N, N, 1, fmt,
         VK_IMAGE_TILING_OPTIMAL,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    s.noiseView = createImageView(device, s.noiseImage.image, fmt32,
+    s.noiseView = createImageView(device, s.noiseImage.image, fmt,
                                   VK_IMAGE_ASPECT_COLOR_BIT, 1);
 
     auto staging = createBuffer(physicalDevice, device, sizeof(pixels),
@@ -633,6 +640,9 @@ void updateSSAOUbo(SSAOTarget& s, uint32_t frameIndex, const glm::mat4& projecti
 
     u.projection    = projection;
     u.invProjection = invProjection;
+    // Original tuned value. (An earlier speculative change to /4 to "match"
+    // the composite box filter visibly increased grain in practice, so it
+    // was reverted — the empirical look wins over the box-period math.)
     u.noiseScale    = glm::vec2(static_cast<float>(mainExtent.width)  / 8.0f,
                                 static_cast<float>(mainExtent.height) / 8.0f);
     u.radius        = settings.ssaoRadius;

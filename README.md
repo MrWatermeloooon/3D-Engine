@@ -26,6 +26,14 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Skybox and split-sum IBL with environment, irradiance, prefiltered specular, and BRDF LUT resources.
 - Frame timing profiler with GPU timestamp scopes and RAII CPU scopes.
 - VMA-backed buffer and image allocation through Vulkan Memory Allocator.
+- Physics integration with Jolt rigid bodies and editor rebuild hooks.
+- 3D audio integration through OpenAL Soft with audio source components.
+- Lua scripting via sol2 with script components.
+- Binary scene serialization and prefab support.
+- Undo/redo command stack for editor actions and gizmo commits.
+- Material editor with preset materials and texture controls.
+- Asset browser with drive navigation, hardened directory walking, and deferred navigation.
+- Hot shader reload through runtime shader recompilation.
 - Motion-vector render target and scene jitter scaffolding for future TAA or upscaling work.
 - Job system with fire-and-forget tasks, blocking `parallel_for`, and frame-work barriers.
 - Variable-rate shading support through `VK_KHR_fragment_shading_rate`, with per-LOD rates and UI override when available.
@@ -64,6 +72,11 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - Mesh BLAS address data is cached at upload time, reducing per-frame TLAS gather overhead.
 - GPU timing covers TLAS build, culling, shadow, main passes, HZB, SSAO, bloom, composite, FXAA, and UI.
 - RT/IBL quality tuning reduced bloom over bright IBL highlights, softened SSAO defaults, restored GI attenuation, raised GI sample limits, and added subgroup quad averaging for GI.
+- Depth sampling now uses a nearest-clamp sampler for D32 depth formats, avoiding invalid linear filtering in SSAO, DoF, and HZB paths.
+- RT acceleration-structure scratch addresses are aligned to the device-reported scratch alignment for BLAS/TLAS builds.
+- Single-time command helpers now check allocation, begin, and end results with `VK_CHECK`.
+- Editor changes now use explicit undo commits rather than heuristic scene-change detection, avoiding redo loss from live physics drift.
+- Gizmo channel edits now update only the active transform channel, preventing translation edits from scrambling rotation.
 
 ## Tech Stack
 
@@ -80,6 +93,10 @@ A C++20 Vulkan rendering engine focused on real-time 3D graphics, modular engine
 - EnTT
 - ImGui
 - ImGuizmo
+- Jolt Physics
+- OpenAL Soft
+- Lua
+- sol2
 - Vulkan Memory Allocator
 
 ## Project Structure
@@ -142,6 +159,7 @@ If a Windows build fails with `LNK1168`, another program may be holding the exec
 
 - RT-off rendering still has some unwanted softness or grain. This is not counted as fixed yet; likely suspects are FXAA edge softening or residual SSAO noise, but it still needs a before/after comparison pass.
 - RT GI can still show visible noise even with subgroup quad averaging. The intended long-term fix is temporal accumulation/TAA.
+- OBJ import currently loads geometry only, not `.mtl` materials or textures. Assign materials/textures manually through the Material Editor or Asset Browser until OBJ material import is added.
 
 ## Future Additions
 
@@ -170,15 +188,10 @@ If a Windows build fails with `LNK1168`, another program may be holding the exec
 
 ### Engine Completeness
 
-- Physics (Jolt): rigid bodies, collision, and raycasting via Jolt Physics.
-- Audio: 3D spatial audio via OpenAL or miniaudio.
-- Scripting (Lua): sol2 bindings and engine API exposure to scripts.
-- Scene serialization: save and load scenes from JSON or a binary format.
-- Prefab system: reusable object templates that can be instantiated and overridden.
-- Material editor: visual node graph for building materials without editing shaders directly.
-- Undo / redo: command pattern support for editor workflows.
-- Asset browser: file explorer panel for dragging meshes, textures, and audio into scenes.
-- Hot shader reload: edit GLSL files and see changes without restarting the engine.
+- OBJ material import: parse `.mtl` files and bind imported diffuse/normal/roughness textures automatically.
+- Scene serialization format polish: versioning, migration, and optional JSON export for debugging.
+- Prefab override UI for inspecting and reverting per-instance edits.
+- Richer material graph editing beyond preset-based material authoring.
 
 ### Performance
 

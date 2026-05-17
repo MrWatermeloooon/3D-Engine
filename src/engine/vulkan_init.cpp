@@ -487,6 +487,18 @@ VkDevice createLogicalDevice(VkPhysicalDevice physicalDevice, const QueueFamilyI
             ok = false;
         }
         if (!ok) RT_SUPPORTED = false;
+
+        if (RT_SUPPORTED) {
+            VkPhysicalDeviceAccelerationStructurePropertiesKHR asProps{};
+            asProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
+            VkPhysicalDeviceProperties2 props2{};
+            props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            props2.pNext = &asProps;
+            vkGetPhysicalDeviceProperties2(physicalDevice, &props2);
+            RT_SCRATCH_ALIGNMENT = asProps.minAccelerationStructureScratchOffsetAlignment
+                                       ? asProps.minAccelerationStructureScratchOffsetAlignment
+                                       : 1u;
+        }
     }
 
     std::cout << "[VulkanEngine] Logical device created"

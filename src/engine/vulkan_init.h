@@ -85,6 +85,11 @@ struct DeviceCapabilities {
     PFN_vkCmdBuildAccelerationStructuresKHR              rtCmdBuildAS            = nullptr;
     PFN_vkCmdWriteAccelerationStructuresPropertiesKHR    rtCmdWriteASProps       = nullptr;
     PFN_vkGetBufferDeviceAddressKHR                      rtGetBufferDeviceAddress = nullptr;
+    // VkPhysicalDeviceAccelerationStructurePropertiesKHR::
+    // minAccelerationStructureScratchOffsetAlignment. AS build scratch device
+    // addresses must be a multiple of this; VMA buffer base addresses are not
+    // guaranteed to satisfy it. 1 = "no constraint" when RT is unsupported.
+    uint32_t rtScratchAlignment = 1;
 };
 
 extern DeviceCapabilities gDeviceCaps;
@@ -103,3 +108,4 @@ inline PFN_vkGetAccelerationStructureDeviceAddressKHR&       RT_GetASDeviceAddre
 inline PFN_vkCmdBuildAccelerationStructuresKHR&              RT_CmdBuildAS            = gDeviceCaps.rtCmdBuildAS;
 inline PFN_vkCmdWriteAccelerationStructuresPropertiesKHR&    RT_CmdWriteASProps       = gDeviceCaps.rtCmdWriteASProps;
 inline PFN_vkGetBufferDeviceAddressKHR&                      RT_GetBufferDeviceAddress = gDeviceCaps.rtGetBufferDeviceAddress;
+inline uint32_t&                                            RT_SCRATCH_ALIGNMENT      = gDeviceCaps.rtScratchAlignment;

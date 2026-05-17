@@ -26,6 +26,7 @@ public:
     glm::mat4 getProjectionMatrix() const;          // Vulkan-flipped (for rendering)
     glm::mat4 getProjectionMatrixUnflipped() const; // Standard (for ImGuizmo)
     glm::vec3 getPosition() const;
+    glm::vec3 getForward()  const;   // normalized world-space view direction
 
     float nearClip() const { return m_near; }
     float farClip()  const { return m_far;  }

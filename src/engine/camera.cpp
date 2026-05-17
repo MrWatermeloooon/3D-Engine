@@ -109,6 +109,13 @@ glm::vec3 Camera::getPosition() const {
     return m_target + offset;
 }
 
+glm::vec3 Camera::getForward() const {
+    if (m_mode == CameraMode::FPS) {
+        return m_front;
+    }
+    return glm::normalize(m_target - getPosition());
+}
+
 void Camera::updateVectors() {
     glm::vec3 front;
     front.x = cos(glm::radians(m_yaw)) * cos(glm::radians(m_pitch));

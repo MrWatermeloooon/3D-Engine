@@ -25,6 +25,10 @@
 #include "sky.h"
 #include "ibl.h"
 #include "profiler.h"
+#include "physics.h"
+#include "audio.h"
+#include "scripting.h"
+#include "undo.h"
 
 #include <memory>
 #include <unordered_map>
@@ -54,6 +58,11 @@ private:
     IblBakeParams    m_iblParams{};
     bool             m_iblRebuildRequested = true;
     std::string      m_pendingGltfLoad;
+
+    // Hot shader reload: UI sets the request; the run loop recompiles the
+    // mesh GLSL from m_shaderSrcDir and rebuilds the main pipeline live.
+    std::string      m_shaderSrcDir = "shaders";
+    bool             m_shaderReloadRequested = false;
     RendererData     m_renderer{};
     DescriptorData   m_descriptors{};
     Camera           m_camera;
@@ -122,6 +131,20 @@ private:
 
     // Job system
     JobSystem        m_jobs;
+
+    // Physics (Jolt). CPU-only; no Vulkan dependency.
+    PhysicsWorld     m_physics;
+
+    // Audio (OpenAL). CPU-only; listener tracks the camera.
+    AudioEngine      m_audio;
+    glm::vec3        m_prevCamPos{0.0f};
+    bool             m_hasPrevCamPos = false;
+
+    // Lua scripting (sol2). Per-entity behaviour scripts.
+    ScriptEngine     m_scripting;
+
+    // Editor undo/redo (whole-scene snapshots).
+    UndoStack        m_undo;
 
     // Per-frame profiler (GPU timestamps + CPU scopes).
     Profiler         m_profiler;

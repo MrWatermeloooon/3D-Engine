@@ -9,6 +9,11 @@
 #include "profiler.h"
 #include "skeletal.h"
 #include "ibl.h"
+#include "physics.h"
+#include "audio.h"
+#include "scripting.h"
+#include "serialization.h"
+#include "undo.h"
 #include "../utils/vk_check.h"
 
 #include <imgui.h>
@@ -140,8 +145,27 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
                       const SkinnedMesh* skinnedMesh,
                       IblBakeParams* iblParams,
                       bool* iblRebuildRequest,
-                      std::string* pendingGltfLoad)
+                      std::string* pendingGltfLoad,
+                      PhysicsWorld* physics,
+                      AudioEngine* audio,
+                      ScriptEngine* scripting,
+                      UndoStack* undo,
+                      std::string* shaderSrcDir,
+                      bool* shaderReloadRequest)
 {
+    // Undo/redo keyboard shortcuts. Handled before the panels so the rest of
+    // the frame already sees the restored scene. Loading a snapshot rebuilds
+    // the registry, so the current selection is no longer valid.
+    if (undo) {
+        ImGuiIO& io = ImGui::GetIO();
+        bool ctrl = io.KeyCtrl;
+        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            if (undo->undo(registry)) m_selectedEntity = entt::null;
+        } else if (ctrl && (ImGui::IsKeyPressed(ImGuiKey_Y, false) ||
+                            (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)))) {
+            if (undo->redo(registry)) m_selectedEntity = entt::null;
+        }
+    }
     // FPS calc
     m_frameCount++;
     m_fpsTimer += deltaTime;
@@ -265,6 +289,7 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
                     mat.roughness = 0.55f;
                     registry.emplace<MaterialComponent>(e, mat);
                     m_selectedEntity = e;
+                    if (undo) undo->commit(registry, "import model");
                 } catch (const std::exception& ex) {
                     ImGui::OpenPopup("Import Failed");
                     static char errBuf[512];
@@ -290,6 +315,7 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             registry.emplace<TransformComponent>(e, t);
             registry.emplace<PointLightComponent>(e);
             m_selectedEntity = e;
+            if (undo) undo->commit(registry, "spawn point light");
         }
         if (ImGui::Button("Spawn Spot Light")) {
             auto e = registry.create();
@@ -298,6 +324,7 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             registry.emplace<TransformComponent>(e, t);
             registry.emplace<SpotLightComponent>(e);
             m_selectedEntity = e;
+            if (undo) undo->commit(registry, "spawn spot light");
         }
         ImGui::SameLine();
         if (ImGui::Button("Spawn Cube")) {
@@ -311,6 +338,7 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             mat.roughness = 0.5f;
             registry.emplace<MaterialComponent>(e, mat);
             m_selectedEntity = e;
+            if (undo) undo->commit(registry, "spawn cube");
         }
         if (ImGui::Button("Spawn Skinned Test")) {
             auto e = registry.create();
@@ -326,6 +354,7 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             mat.roughness = 0.5f;
             registry.emplace<MaterialComponent>(e, mat);
             m_selectedEntity = e;
+            if (undo) undo->commit(registry, "spawn skinned");
         }
         // Spawn a 30×30 grid of icosphere instances using a 4-level LOD group
         // (1280 / 320 / 80 / 20 tris). The LOD group is created on first click
@@ -368,6 +397,7 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
                 mat.roughness = 0.45f;
                 registry.emplace<MaterialComponent>(e, mat);
             }
+            if (undo) undo->commit(registry, "spawn 900 LOD spheres");
         }
         if (ImGui::Button("Spawn 1000 Cubes (instanced demo)")) {
             for (int i = 0; i < 1000; ++i) {
@@ -388,6 +418,7 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
                 mat.roughness = 0.2f + ((i * 37) % 100) / 100.0f * 0.6f;
                 registry.emplace<MaterialComponent>(e, mat);
             }
+            if (undo) undo->commit(registry, "spawn 1000 cubes");
         }
     }
     ImGui::End();
@@ -591,6 +622,7 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
             if (ImGui::Button("Delete")) {
                 registry.destroy(e);
                 m_selectedEntity = entt::null;
+                if (undo) undo->commit(registry, "delete entity");
             }
         } else {
             ImGui::TextDisabled("Select an entity in the hierarchy");
@@ -809,6 +841,414 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
     }
     ImGui::End();
 
+    // ── Physics (Jolt) ──────────────────────────────────────────────────
+    if (physics && ImGui::Begin("Physics")) {
+        ImGui::Text("Bodies: %d", physics->bodyCount());
+
+        glm::vec3 g = physics->gravity();
+        if (ImGui::DragFloat3("Gravity", &g.x, 0.1f, -50.0f, 50.0f, "%.2f"))
+            physics->setGravity(g);
+
+        bool paused = physics->paused();
+        if (ImGui::Checkbox("Pause simulation", &paused))
+            physics->setPaused(paused);
+
+        float ts = physics->timeScale();
+        if (ImGui::SliderFloat("Time scale", &ts, 0.0f, 3.0f, "%.2fx"))
+            physics->setTimeScale(ts);
+
+        ImGui::Separator();
+        if (ImGui::Button("Spawn dynamic box")) {
+            glm::vec3 spawn = camera.getPosition() + camera.getForward() * 3.0f;
+            auto e = registry.create();
+            registry.emplace<NameComponent>(e, std::string("PhysicsBox"));
+            TransformComponent t{};
+            t.position = spawn;
+            t.scale    = glm::vec3(0.5f);
+            registry.emplace<TransformComponent>(e, t);
+            registry.emplace<MeshComponent>(e, resources.getDefaultCube());
+            MaterialComponent mat{};
+            mat.texture   = resources.getDefaultTexture();
+            mat.color     = glm::vec4(0.3f, 0.6f, 0.95f, 1.0f);
+            mat.metallic  = 0.0f;
+            mat.roughness = 0.5f;
+            registry.emplace<MaterialComponent>(e, mat);
+            RigidBodyComponent rb{};
+            rb.motion = RigidBodyComponent::Motion::Dynamic;
+            rb.shape  = RigidBodyComponent::Shape::Box;
+            rb.autoShapeFromScale = true;
+            rb.mass   = 1.0f;
+            registry.emplace<RigidBodyComponent>(e, rb);
+            m_selectedEntity = e;
+            if (undo) undo->commit(registry, "spawn physics box");
+        }
+
+        if (ImGui::Button("Raycast from camera")) {
+            auto hit = physics->raycast(camera.getPosition(),
+                                        camera.getForward(), 100.0f);
+            m_lastRayValid = true;
+            m_lastRayHit   = hit.has_value();
+            if (hit) {
+                m_lastRayPoint[0]  = hit->point.x;
+                m_lastRayPoint[1]  = hit->point.y;
+                m_lastRayPoint[2]  = hit->point.z;
+                m_lastRayNormal[0] = hit->normal.x;
+                m_lastRayNormal[1] = hit->normal.y;
+                m_lastRayNormal[2] = hit->normal.z;
+                m_lastRayDist      = hit->distance;
+                if (hit->entity != entt::null && registry.valid(hit->entity))
+                    m_selectedEntity = hit->entity;
+            }
+        }
+        if (m_lastRayValid) {
+            if (m_lastRayHit) {
+                ImGui::Text("Hit @ (%.2f, %.2f, %.2f)  dist %.2f",
+                            m_lastRayPoint[0], m_lastRayPoint[1],
+                            m_lastRayPoint[2], m_lastRayDist);
+                ImGui::Text("Normal (%.2f, %.2f, %.2f)",
+                            m_lastRayNormal[0], m_lastRayNormal[1],
+                            m_lastRayNormal[2]);
+            } else {
+                ImGui::TextDisabled("Last raycast: no hit");
+            }
+        }
+        if (m_selectedEntity != entt::null && registry.valid(m_selectedEntity)) {
+            ImGui::Separator();
+            ImGui::Text("Selected entity");
+            auto* rb = registry.try_get<RigidBodyComponent>(m_selectedEntity);
+            if (rb) {
+                int motion = static_cast<int>(rb->motion);
+                const char* motions[] = { "Static", "Dynamic", "Kinematic" };
+                if (ImGui::Combo("Motion", &motion, motions, 3))
+                    rb->motion = static_cast<RigidBodyComponent::Motion>(motion);
+                int shape = static_cast<int>(rb->shape);
+                const char* shapes[] = { "Box", "Sphere", "Capsule" };
+                if (ImGui::Combo("Shape", &shape, shapes, 3))
+                    rb->shape = static_cast<RigidBodyComponent::Shape>(shape);
+                ImGui::Checkbox("Auto shape from scale", &rb->autoShapeFromScale);
+                if (rb->shape != RigidBodyComponent::Shape::Box ||
+                    !rb->autoShapeFromScale) {
+                    ImGui::DragFloat3("Half extent", &rb->halfExtent.x, 0.05f,
+                                      0.01f, 100.0f);
+                    ImGui::DragFloat("Radius", &rb->radius, 0.05f, 0.01f, 100.0f);
+                    ImGui::DragFloat("Half height", &rb->halfHeight, 0.05f,
+                                     0.01f, 100.0f);
+                }
+                ImGui::SliderFloat("Mass", &rb->mass, 0.1f, 100.0f);
+                ImGui::SliderFloat("Friction", &rb->friction, 0.0f, 2.0f);
+                ImGui::SliderFloat("Restitution", &rb->restitution, 0.0f, 1.0f);
+                if (ImGui::Button("Rebuild body")) {
+                    // Re-add the component so on_destroy frees the old Jolt
+                    // body and syncNewBodies builds a fresh one with the
+                    // edited motion/shape/mass next frame.
+                    RigidBodyComponent copy = *rb;
+                    copy.bodyId = 0xFFFFFFFFu;
+                    registry.remove<RigidBodyComponent>(m_selectedEntity);
+                    registry.emplace<RigidBodyComponent>(m_selectedEntity, copy);
+                    if (undo) undo->commit(registry, "rebuild body");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Remove body")) {
+                    registry.remove<RigidBodyComponent>(m_selectedEntity);
+                    if (undo) undo->commit(registry, "remove body");
+                }
+                ImGui::TextDisabled("Edit motion/shape/size then Rebuild body.");
+            } else {
+                ImGui::TextDisabled("No rigid body on this entity.");
+                if (ImGui::Button("Add dynamic body")) {
+                    RigidBodyComponent r{};
+                    r.motion = RigidBodyComponent::Motion::Dynamic;
+                    r.shape  = RigidBodyComponent::Shape::Box;
+                    r.autoShapeFromScale = true;
+                    registry.emplace<RigidBodyComponent>(m_selectedEntity, r);
+                    if (undo) undo->commit(registry, "add dynamic body");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Add static body")) {
+                    RigidBodyComponent r{};
+                    r.motion = RigidBodyComponent::Motion::Static;
+                    r.shape  = RigidBodyComponent::Shape::Box;
+                    r.autoShapeFromScale = true;
+                    registry.emplace<RigidBodyComponent>(m_selectedEntity, r);
+                    if (undo) undo->commit(registry, "add static body");
+                }
+            }
+        }
+        ImGui::TextDisabled("Spawned boxes fall under gravity onto the floor.");
+    }
+    if (physics) ImGui::End();
+
+    // ── Audio (OpenAL) ──────────────────────────────────────────────────
+    if (audio && ImGui::Begin("Audio")) {
+        if (!audio->ok()) {
+            ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1),
+                               "OpenAL device unavailable");
+        }
+        float mg = audio->masterGain();
+        if (ImGui::SliderFloat("Master volume", &mg, 0.0f, 1.0f, "%.2f"))
+            audio->setMasterGain(mg);
+
+        if (ImGui::Button("Spawn 3D sound emitter")) {
+            glm::vec3 p = camera.getPosition() + camera.getForward() * 4.0f;
+            auto e = registry.create();
+            registry.emplace<NameComponent>(e, std::string("Sound Emitter"));
+            TransformComponent t{};
+            t.position = p;
+            t.scale    = glm::vec3(0.3f);
+            registry.emplace<TransformComponent>(e, t);
+            registry.emplace<MeshComponent>(e, resources.getDefaultCube());
+            MaterialComponent mat{};
+            mat.texture   = resources.getDefaultTexture();
+            mat.color     = glm::vec4(0.95f, 0.85f, 0.20f, 1.0f);
+            mat.metallic  = 0.0f;
+            mat.roughness = 0.6f;
+            registry.emplace<MaterialComponent>(e, mat);
+            AudioSourceComponent as{};
+            as.toneHz  = 440.0f;
+            as.loop    = true;
+            as.spatial = true;
+            as.playing = true;
+            registry.emplace<AudioSourceComponent>(e, as);
+            m_selectedEntity = e;
+            if (undo) undo->commit(registry, "spawn sound emitter");
+        }
+        ImGui::TextDisabled("Move the camera around an emitter to hear panning.");
+
+        if (m_selectedEntity != entt::null && registry.valid(m_selectedEntity)) {
+            if (auto* a = registry.try_get<AudioSourceComponent>(m_selectedEntity)) {
+                ImGui::Separator();
+                ImGui::Text("Selected emitter");
+                ImGui::Checkbox("Playing", &a->playing);
+                ImGui::SliderFloat("Gain",  &a->gain,  0.0f, 2.0f);
+                ImGui::SliderFloat("Pitch", &a->pitch, 0.25f, 4.0f);
+                ImGui::Checkbox("Loop", &a->loop);
+                ImGui::Checkbox("Spatial (mono only)", &a->spatial);
+                ImGui::BeginDisabled(!a->spatial);
+                ImGui::SliderFloat("Ref distance", &a->refDistance, 0.5f, 20.0f);
+                ImGui::SliderFloat("Max distance", &a->maxDistance, 1.0f, 200.0f);
+                ImGui::SliderFloat("Rolloff", &a->rolloff, 0.0f, 5.0f);
+                ImGui::EndDisabled();
+                if (a->clip.empty()) {
+                    ImGui::SliderFloat("Tone Hz", &a->toneHz, 80.0f, 2000.0f);
+                    ImGui::TextDisabled("Procedural tone (no clip set).");
+                }
+                static char clipBuf[260];
+                static entt::entity clipFor = entt::null;
+                if (clipFor != m_selectedEntity) {
+                    std::strncpy(clipBuf, a->clip.c_str(), sizeof(clipBuf));
+                    clipBuf[sizeof(clipBuf) - 1] = '\0';
+                    clipFor = m_selectedEntity;
+                }
+                ImGui::InputText(".wav path", clipBuf, sizeof(clipBuf));
+                if (ImGui::Button("Apply clip")) {
+                    a->clip = clipBuf;
+                    a->sourceId = 0;   // force AudioEngine to rebuild the source
+                    a->bufferId = 0;
+                    if (undo) undo->commit(registry, "set audio clip");
+                }
+                if (ImGui::Button("Remove audio source")) {
+                    registry.remove<AudioSourceComponent>(m_selectedEntity);
+                    if (undo) undo->commit(registry, "remove audio source");
+                }
+            } else {
+                ImGui::Separator();
+                ImGui::TextDisabled("Selected entity has no audio source.");
+                if (ImGui::Button("Add audio source to selected")) {
+                    AudioSourceComponent as{};
+                    as.toneHz = 440.0f; as.loop = true;
+                    as.spatial = true;  as.playing = true;
+                    registry.emplace<AudioSourceComponent>(m_selectedEntity, as);
+                    if (undo) undo->commit(registry, "add audio source");
+                }
+            }
+        }
+    }
+    if (audio) ImGui::End();
+
+    // ── Scripting (Lua) ─────────────────────────────────────────────────
+    if (scripting && ImGui::Begin("Scripting")) {
+        if (ImGui::Button("Create sample script + entity")) {
+            const char* sp = "script_sample.lua";
+            ScriptEngine::writeSampleScript(sp);
+            glm::vec3 p = camera.getPosition() + camera.getForward() * 4.0f;
+            auto e = registry.create();
+            registry.emplace<NameComponent>(e, std::string("Scripted Cube"));
+            TransformComponent t{};
+            t.position = p;
+            registry.emplace<TransformComponent>(e, t);
+            registry.emplace<MeshComponent>(e, resources.getDefaultCube());
+            MaterialComponent mat{};
+            mat.texture   = resources.getDefaultTexture();
+            mat.color     = glm::vec4(0.55f, 0.85f, 0.55f, 1.0f);
+            mat.roughness = 0.5f;
+            registry.emplace<MaterialComponent>(e, mat);
+            registry.emplace<ScriptComponent>(e, ScriptComponent{ sp, true });
+            m_selectedEntity = e;
+            if (undo) undo->commit(registry, "create scripted cube");
+        }
+        ImGui::TextDisabled("Writes script_sample.lua next to the working dir.\n"
+                            "Edit & save it while running to hot-reload.");
+
+        if (m_selectedEntity != entt::null && registry.valid(m_selectedEntity)) {
+            ImGui::Separator();
+            static char pathBuf[260];
+            static entt::entity pathFor = entt::null;
+            auto* sc = registry.try_get<ScriptComponent>(m_selectedEntity);
+            if (pathFor != m_selectedEntity) {
+                std::strncpy(pathBuf, sc ? sc->path.c_str() : "", sizeof(pathBuf));
+                pathBuf[sizeof(pathBuf) - 1] = '\0';
+                pathFor = m_selectedEntity;
+            }
+            ImGui::InputText(".lua path", pathBuf, sizeof(pathBuf));
+            if (sc) {
+                ImGui::Checkbox("Enabled", &sc->enabled);
+                if (ImGui::Button("Apply path")) {
+                    sc->path = pathBuf;
+                    if (undo) undo->commit(registry, "set script path");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Remove script")) {
+                    registry.remove<ScriptComponent>(m_selectedEntity);
+                    if (undo) undo->commit(registry, "remove script");
+                }
+            } else if (ImGui::Button("Attach script to selected")) {
+                registry.emplace<ScriptComponent>(
+                    m_selectedEntity, ScriptComponent{ pathBuf, true });
+                if (undo) undo->commit(registry, "attach script");
+            }
+        }
+
+        ImGui::Separator();
+        if (ImGui::Button("Clear log")) scripting->clearLog();
+        ImGui::BeginChild("scriptlog", ImVec2(0, 140), true);
+        for (const auto& line : scripting->log())
+            ImGui::TextWrapped("%s", line.c_str());
+        ImGui::EndChild();
+    }
+    if (scripting) ImGui::End();
+
+    // ── Scene (binary save / load) ──────────────────────────────────────
+    if (ImGui::Begin("Scene")) {
+        static char sceneBuf[260] = "scene.bin";
+        static std::string sceneStatus;
+        ImGui::InputText("File", sceneBuf, sizeof(sceneBuf));
+        if (ImGui::Button("Save scene")) {
+            bool okSave = SceneSerializer::save(registry, sceneBuf);
+            sceneStatus = okSave ? std::string("Saved to ") + sceneBuf
+                                 : std::string("Save FAILED: ") + sceneBuf;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load scene")) {
+            bool okLoad = SceneSerializer::load(registry, sceneBuf);
+            m_selectedEntity = entt::null;   // registry was cleared
+            sceneStatus = okLoad ? std::string("Loaded from ") + sceneBuf
+                                 : std::string("Load FAILED: ") + sceneBuf;
+            if (okLoad && undo) undo->commit(registry, "load scene");
+        }
+        if (!sceneStatus.empty()) ImGui::TextWrapped("%s", sceneStatus.c_str());
+        ImGui::TextDisabled("Load replaces the whole scene. Physics/audio/\n"
+                            "scripts rebuild automatically. Skinned meshes and\n"
+                            "LOD groups are not serialized (v1).");
+    }
+    ImGui::End();
+
+    // ── Prefabs (single-entity templates, built on the scene codec) ─────
+    if (ImGui::Begin("Prefabs")) {
+        static char prefabBuf[260] = "prefab.vepf";
+        static std::string prefabStatus;
+        ImGui::InputText("Prefab file", prefabBuf, sizeof(prefabBuf));
+
+        bool hasSel = m_selectedEntity != entt::null &&
+                      registry.valid(m_selectedEntity);
+        ImGui::BeginDisabled(!hasSel);
+        if (ImGui::Button("Save selected as prefab")) {
+            bool okP = Prefab::save(registry, m_selectedEntity, prefabBuf);
+            prefabStatus = okP ? std::string("Saved prefab: ") + prefabBuf
+                               : std::string("Save FAILED: ") + prefabBuf;
+        }
+        ImGui::EndDisabled();
+        if (!hasSel)
+            ImGui::TextDisabled("Select an entity to save it as a prefab.");
+
+        if (ImGui::Button("Instantiate at camera")) {
+            glm::vec3 p = camera.getPosition() + camera.getForward() * 4.0f;
+            entt::entity e = Prefab::instantiate(registry, prefabBuf, &p);
+            if (e != entt::null) {
+                m_selectedEntity = e;
+                prefabStatus = std::string("Instantiated ") + prefabBuf;
+                if (undo) undo->commit(registry, "instantiate prefab");
+            } else {
+                prefabStatus = std::string("Instantiate FAILED: ") + prefabBuf;
+            }
+        }
+        if (!prefabStatus.empty())
+            ImGui::TextWrapped("%s", prefabStatus.c_str());
+        ImGui::TextDisabled("Each instance is independent — physics/audio/\n"
+                            "script handles rebuild per copy.");
+    }
+    ImGui::End();
+
+    // ── History (undo / redo) ───────────────────────────────────────────
+    if (undo && ImGui::Begin("History")) {
+        ImGui::BeginDisabled(!undo->canUndo());
+        if (ImGui::Button("Undo (Ctrl+Z)") && undo->undo(registry))
+            m_selectedEntity = entt::null;
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!undo->canRedo());
+        if (ImGui::Button("Redo (Ctrl+Y)") && undo->redo(registry))
+            m_selectedEntity = entt::null;
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        const auto& labels = undo->labels();
+        for (int i = 0; i < static_cast<int>(labels.size()); ++i) {
+            bool cur = (i == undo->cursor());
+            ImGui::TextColored(cur ? ImVec4(0.45f, 0.9f, 0.45f, 1.0f)
+                                   : ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                               "%s %s", cur ? ">" : " ", labels[i].c_str());
+        }
+        ImGui::TextDisabled("Snapshots editor actions (not physics motion).");
+    }
+    if (undo) ImGui::End();
+
+    // ── Material Editor (node graph → PBR MaterialComponent) ────────────
+    if (ImGui::Begin("Material Editor")) {
+        if (m_materialGraph.draw(registry, m_selectedEntity, resources))
+            if (undo) undo->commit(registry, "material edit");
+    }
+    ImGui::End();
+
+    // ── Asset Browser ───────────────────────────────────────────────────
+    if (ImGui::Begin("Asset Browser")) {
+        if (m_assetBrowser.draw(registry, m_selectedEntity, resources, camera))
+            if (undo) undo->commit(registry, "asset browser");
+    }
+    ImGui::End();
+
+    // ── Shader Reload ───────────────────────────────────────────────────
+    if (shaderSrcDir && shaderReloadRequest && ImGui::Begin("Shader Reload")) {
+        static char dirBuf[512];
+        static bool dirInit = false;
+        if (!dirInit) {
+            std::strncpy(dirBuf, shaderSrcDir->c_str(), sizeof(dirBuf));
+            dirBuf[sizeof(dirBuf) - 1] = '\0';
+            dirInit = true;
+        }
+        ImGui::TextWrapped("Recompiles mesh.vert + mesh.frag from this GLSL "
+                           "source folder and rebuilds the main pipeline "
+                           "live (no restart).");
+        ImGui::InputText("GLSL src dir", dirBuf, sizeof(dirBuf));
+        if (ImGui::Button("Recompile mesh shaders")) {
+            *shaderSrcDir = dirBuf;
+            *shaderReloadRequest = true;
+        }
+        ImGui::TextDisabled("Edit shaders/mesh.frag, save, click this.\n"
+                            "Needs glslc (VULKAN_SDK set or on PATH).\n"
+                            "Console shows [Shaders] result. Skinned-mesh\n"
+                            "pipeline is not hot-reloaded (v1 scope).");
+    }
+    if (shaderSrcDir && shaderReloadRequest) ImGui::End();
+
     // ── ImGuizmo over the central viewport ──────────────────────────────
     if (m_selectedEntity != entt::null && registry.valid(m_selectedEntity)) {
         auto* t = registry.try_get<TransformComponent>(m_selectedEntity);
@@ -832,11 +1272,25 @@ void DebugUI::buildUI(entt::registry& registry, ResourceManager& resources,
                 glm::vec3 newPos, newRot, newScale;
                 ImGuizmo::DecomposeMatrixToComponents(glm::value_ptr(model),
                                                       &newPos.x, &newRot.x, &newScale.x);
-                t->position = newPos;
-                t->rotation = newRot;
-                t->scale    = newScale;
+                // Only write the channel the active gizmo edits. ImGuizmo's
+                // euler decomposition uses a different order than the engine's
+                // getMatrix() recomposition, so blindly writing all three back
+                // every frame corrupts rotation on any already-rotated object
+                // (scripted/rotator cubes, tumbled physics bodies) — it spins
+                // wildly while you merely translate it.
+                if (m_gizmoOperation == ImGuizmo::TRANSLATE)   t->position = newPos;
+                else if (m_gizmoOperation == ImGuizmo::ROTATE) t->rotation = newRot;
+                else if (m_gizmoOperation == ImGuizmo::SCALE)  t->scale    = newScale;
             }
         }
+    }
+
+    // Commit ONE undo entry when the gizmo is released (not per drag frame).
+    // All other editor actions commit explicitly at their button handlers.
+    if (undo) {
+        bool gizmoUsing = ImGuizmo::IsUsing();
+        if (m_gizmoWasUsing && !gizmoUsing) undo->commit(registry, "transform");
+        m_gizmoWasUsing = gizmoUsing;
     }
 }
 

@@ -641,7 +641,14 @@ void main() {
     //     quadruples the sample budget at zero ray cost. Slight 2x2 spatial
     //     blur — fine for low-frequency GI, occasional artefacts on triangle
     //     edges where the quad straddles two primitives.
-    if (scene.rtParams3.x > 0.5 && metallic < 0.5) {
+    //
+    // The subgroupQuadSwap* ops require all 4 lanes of the 2x2 quad to be
+    // active — quad ops read undefined data from inactive lanes. `metallic`
+    // is per-fragment, so it must NOT gate the swap (a quad straddling a
+    // metal/dielectric edge would diverge and corrupt the average). Only the
+    // scene-uniform rtParams3.x gates the GI compute + reduction; the
+    // per-fragment metallic test only decides whether to APPLY the result.
+    if (scene.rtParams3.x > 0.5) {
         vec3 giRadiance = rtGI(vWorldPos, N, sunToLight, sunRadiance, seed);
         vec3 quadSum  = giRadiance;
         quadSum += subgroupQuadSwapHorizontal(giRadiance);
@@ -649,8 +656,10 @@ void main() {
         quadSum += subgroupQuadSwapDiagonal(giRadiance);
         giRadiance = quadSum * 0.25;
 
-        vec3 giAmbient  = kD_indirect * albedo * giRadiance * 0.5;
-        diffuseIndirect = mix(diffuseIndirect, giAmbient, scene.rtParams3.w);
+        if (metallic < 0.5) {
+            vec3 giAmbient  = kD_indirect * albedo * giRadiance * 0.5;
+            diffuseIndirect = mix(diffuseIndirect, giAmbient, scene.rtParams3.w);
+        }
     }
 
     // Specular: split-sum approximation. textureLod into the prefiltered

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 
 VkVertexInputBindingDescription getSkinnedVertexBinding() {
     VkVertexInputBindingDescription b{};
@@ -238,6 +239,15 @@ void computeBoneMatrices(const Skeleton& skeleton, const Animation& anim, float 
         world[i] = (p < 0) ? local : world[p] * local;
     }
 
+    if (N > MAX_BONES) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "[VulkanEngine] Skeleton has " << N << " joints but MAX_BONES is "
+                      << MAX_BONES << "; joints beyond the limit are dropped and vertices "
+                         "weighted to them will deform incorrectly.\n";
+        }
+    }
     for (size_t i = 0; i < N && i < MAX_BONES; ++i) {
         outPalette.bones[i] = world[i] * skeleton.joints[i].inverseBind;
     }

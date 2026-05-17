@@ -44,6 +44,15 @@ VkDeviceAddress getBufferDeviceAddress(VkDevice device, VkBuffer buffer) {
     return RT_GetBufferDeviceAddress(device, &info);
 }
 
+// AS build scratch addresses must be a multiple of
+// minAccelerationStructureScratchOffsetAlignment (RT_SCRATCH_ALIGNMENT).
+// Scratch buffers are over-allocated by that alignment so the rounded-up
+// address still leaves buildScratchSize usable bytes.
+static VkDeviceAddress alignScratchAddress(VkDeviceAddress addr) {
+    const VkDeviceAddress a = RT_SCRATCH_ALIGNMENT;
+    return (a <= 1) ? addr : ((addr + a - 1) / a) * a;
+}
+
 // ── BLAS build ──────────────────────────────────────────────────────────────
 
 void buildMeshBlas(Mesh& mesh, VkPhysicalDevice physicalDevice, VkDevice device,
@@ -104,12 +113,14 @@ void buildMeshBlas(Mesh& mesh, VkPhysicalDevice physicalDevice, VkDevice device,
     ci.type   = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
     VK_CHECK(RT_CreateAS(device, &ci, nullptr, &mesh.rt.accel));
 
-    AllocatedBuffer scratch = createBuffer(physicalDevice, device, sizes.buildScratchSize,
+    AllocatedBuffer scratch = createBuffer(physicalDevice, device,
+        sizes.buildScratchSize + RT_SCRATCH_ALIGNMENT,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     build.dstAccelerationStructure   = mesh.rt.accel;
-    build.scratchData.deviceAddress  = getBufferDeviceAddress(device, scratch.buffer);
+    build.scratchData.deviceAddress  = alignScratchAddress(
+        getBufferDeviceAddress(device, scratch.buffer));
 
     // ── Submit build ──────────────────────────────────────────────────────
     VkCommandBuffer cmd = beginSingleTimeCommands(device, commandPool);
@@ -258,12 +269,13 @@ void buildTlas(RtScene& scene, uint32_t frame,
     (void)tlasResized;
 
     ensureBuffer(scene.scratchBuffer[frame], scene.scratchCapacity[frame],
-                 physicalDevice, device, sizes.buildScratchSize,
+                 physicalDevice, device, sizes.buildScratchSize + RT_SCRATCH_ALIGNMENT,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     build.dstAccelerationStructure  = scene.tlas[frame];
-    build.scratchData.deviceAddress = getBufferDeviceAddress(device, scene.scratchBuffer[frame].buffer);
+    build.scratchData.deviceAddress = alignScratchAddress(
+        getBufferDeviceAddress(device, scene.scratchBuffer[frame].buffer));
 
     // ── Record the build ──────────────────────────────────────────────────
     VkAccelerationStructureBuildRangeInfoKHR range{};

@@ -144,19 +144,19 @@ VkCommandBuffer beginSingleTimeCommands(VkDevice device, VkCommandPool commandPo
     allocInfo.commandBufferCount = 1;
 
     VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &allocInfo, &cmd);
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &cmd));
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
     return cmd;
 }
 
 void endSingleTimeCommands(VkDevice device, VkCommandPool commandPool,
                            VkQueue queue, VkCommandBuffer cmd) {
-    vkEndCommandBuffer(cmd);
+    VK_CHECK(vkEndCommandBuffer(cmd));
 
     // Submit with a per-call fence and wait on that fence specifically.
     // Avoids vkQueueWaitIdle which stalls the entire queue (problematic during

@@ -8,6 +8,10 @@
     "tinyobjloader",
     "cgltf",
     "entt",
+    "joltphysics",
+    "openal-soft",
+    "lua",
+    "sol2",
     "vulkan-memory-allocator",
     {
       "name": "imgui",

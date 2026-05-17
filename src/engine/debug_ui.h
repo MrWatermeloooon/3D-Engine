@@ -7,11 +7,18 @@
 
 #include <entt/entt.hpp>
 
+#include "material_graph.h"
+#include "asset_browser.h"
+
 #include <string>
 
 class Camera;
 class ResourceManager;
 class Profiler;
+class PhysicsWorld;
+class AudioEngine;
+class ScriptEngine;
+class UndoStack;
 struct ShadowData;
 struct PostFXSettings;
 struct RtSettings;
@@ -36,7 +43,13 @@ public:
                  const SkinnedMesh* skinnedMesh = nullptr,
                  IblBakeParams* iblParams = nullptr,
                  bool* iblRebuildRequest = nullptr,
-                 std::string* pendingGltfLoad = nullptr);
+                 std::string* pendingGltfLoad = nullptr,
+                 PhysicsWorld* physics = nullptr,
+                 AudioEngine* audio = nullptr,
+                 ScriptEngine* scripting = nullptr,
+                 UndoStack* undo = nullptr,
+                 std::string* shaderSrcDir = nullptr,
+                 bool* shaderReloadRequest = nullptr);
     void endFrame();
 
 private:
@@ -58,4 +71,21 @@ private:
     // Animator scrubber: remembers whether playback was active when the slider
     // was grabbed, so releasing the slider restores that state.
     bool m_animScrubWasPlaying = false;
+
+    // Tracks ImGuizmo drag state so a transform edit commits one undo entry
+    // on release (not one per frame of the drag).
+    bool m_gizmoWasUsing = false;
+
+    // Visual node-graph material editor (composes the PBR MaterialComponent).
+    MaterialGraph m_materialGraph;
+
+    // Project file explorer (spawn meshes / apply textures / attach audio).
+    AssetBrowser  m_assetBrowser;
+
+    // Last camera raycast result (Physics panel readout).
+    bool  m_lastRayValid    = false;
+    bool  m_lastRayHit      = false;
+    float m_lastRayPoint[3] { 0, 0, 0 };
+    float m_lastRayNormal[3]{ 0, 0, 0 };
+    float m_lastRayDist     = 0.0f;
 };

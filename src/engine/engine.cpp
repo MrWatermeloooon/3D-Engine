@@ -10,8 +10,29 @@
 #include <stdexcept>
 #include <vector>
 #include <cstring>
+#include <cstdlib>
 
 #include <glm/gtc/matrix_transform.hpp>
+
+namespace {
+    // Recompile one GLSL file to SPIR-V with glslc, matching the build's
+    // flags (--target-env=vulkan1.2). Tries $VULKAN_SDK\Bin\glslc.exe then
+    // glslc on PATH. Returns true on a zero exit code.
+    bool recompileShader(const std::string& src, const std::string& outSpv) {
+        std::vector<std::string> glslcs;
+        if (const char* sdk = std::getenv("VULKAN_SDK"))
+            glslcs.push_back(std::string(sdk) + "\\Bin\\glslc.exe");
+        glslcs.push_back("glslc");
+        for (const auto& g : glslcs) {
+            // Whole command is wrapped in quotes for cmd.exe because the
+            // program path and the repo path both contain spaces.
+            std::string cmd = "\"\"" + g + "\" --target-env=vulkan1.2 \"" +
+                              src + "\" -o \"" + outSpv + "\"\"";
+            if (std::system(cmd.c_str()) == 0) return true;
+        }
+        return false;
+    }
+}
 
 // ── Init ────────────────────────────────────────────────────────────────────
 
@@ -244,6 +265,52 @@ void Engine::init() {
 
     m_scene.createDefaultScene(m_resources);
 
+    // Physics: init the Jolt world, then create bodies for any scene entities
+    // that already have a RigidBodyComponent (the default scene's floor + the
+    // falling-box demo).
+    m_physics.init();
+    m_physics.syncNewBodies(m_scene.registry());
+
+    // Audio: OpenAL device/context. Listener is driven by the camera each
+    // frame; emitters come from AudioSourceComponent entities.
+    m_audio.init();
+
+    // Release backing Jolt/OpenAL objects when an entity (or its component)
+    // is destroyed, e.g. via the Hierarchy "Delete" button. Without this the
+    // OpenAL source keeps playing and the Jolt body leaks. on_destroy fires
+    // while the component is still readable, so removeBody/removeSource can
+    // read the stored handle.
+    {
+        auto& reg = m_scene.registry();
+        reg.on_destroy<RigidBodyComponent>()
+            .connect<&PhysicsWorld::removeBody>(m_physics);
+        reg.on_destroy<AudioSourceComponent>()
+            .connect<&AudioEngine::removeSource>(m_audio);
+        reg.on_destroy<ScriptComponent>()
+            .connect<&ScriptEngine::onDestroy>(m_scripting);
+    }
+
+    // Scripting: Lua via sol2. spawn_cube() in scripts routes here so
+    // scripting needn't know about ResourceManager.
+    m_scripting.init(
+        m_window->getHandle(), &m_physics,
+        [this](const glm::vec3& p) -> entt::entity {
+            auto& reg = m_scene.registry();
+            auto e = reg.create();
+            reg.emplace<NameComponent>(e, std::string("ScriptCube"));
+            TransformComponent t{};
+            t.position = p;
+            reg.emplace<TransformComponent>(e, t);
+            reg.emplace<MeshComponent>(e, m_resources.getDefaultCube());
+            MaterialComponent mat{};
+            mat.texture   = m_resources.getDefaultTexture();
+            mat.color     = glm::vec4(0.6f, 0.8f, 1.0f, 1.0f);
+            mat.metallic  = 0.0f;
+            mat.roughness = 0.5f;
+            reg.emplace<MaterialComponent>(e, mat);
+            return e;
+        });
+
     m_camera.setAspectRatio(static_cast<float>(m_swapchain.extent.width) /
                             static_cast<float>(m_swapchain.extent.height));
 
@@ -255,6 +322,9 @@ void Engine::init() {
     // Profiler: GPU timestamps + CPU scopes. Independent of any GPU work; safe
     // to init last. Per-frame query pools sized for MAX_FRAMES_IN_FLIGHT.
     m_profiler.init(m_vk.device, m_vk.physicalDevice, MAX_FRAMES_IN_FLIGHT);
+
+    // Seed undo history with the initial scene state.
+    m_undo.seed(m_scene.registry());
 
     m_lastFrameTime = glfwGetTime();
     std::cout << "[VulkanEngine] Initialization complete\n";
@@ -333,6 +403,27 @@ void Engine::run() {
             PROFILE_CPU(m_profiler, "scene update");
             m_scene.update(dt);
         }
+        {
+            PROFILE_CPU(m_profiler, "scripts");
+            m_scripting.update(m_scene.registry(), dt, currentTime);
+        }
+        {
+            PROFILE_CPU(m_profiler, "physics");
+            m_physics.syncNewBodies(m_scene.registry());
+            m_physics.step(m_scene.registry(), dt);
+        }
+        {
+            PROFILE_CPU(m_profiler, "audio");
+            glm::vec3 camPos = m_camera.getPosition();
+            glm::vec3 camFwd = m_camera.getForward();
+            float invDt = (dt > 1e-4f) ? (1.0f / dt) : 0.0f;
+            glm::vec3 camVel = m_hasPrevCamPos
+                ? (camPos - m_prevCamPos) * invDt : glm::vec3(0.0f);
+            m_prevCamPos = camPos;
+            m_hasPrevCamPos = true;
+            m_audio.update(m_scene.registry(), camPos, camFwd,
+                           glm::vec3(0.0f, 1.0f, 0.0f), camVel);
+        }
 
         m_hotReloadTimer += dt;
         // Subtract the interval instead of zeroing — zeroing accumulates
@@ -345,7 +436,9 @@ void Engine::run() {
                           m_visibleEntities, m_totalEntities,
                           dt, &m_profiler, &m_skinnedMesh,
                           &m_iblParams, &m_iblRebuildRequested,
-                          &m_pendingGltfLoad);
+                          &m_pendingGltfLoad, &m_physics, &m_audio,
+                          &m_scripting, &m_undo,
+                          &m_shaderSrcDir, &m_shaderReloadRequested);
 
         if (!m_pendingGltfLoad.empty()) {
             vkDeviceWaitIdle(m_vk.device);
@@ -389,6 +482,37 @@ void Engine::run() {
                               m_ibl.cubeSampler, m_ibl.lutSampler);
             }
             m_iblRebuildRequested = false;
+        }
+
+        // Hot shader reload: recompile the mesh GLSL and rebuild the main
+        // pipeline live. vkDeviceWaitIdle makes the destroy/recreate safe
+        // (same approach as the IBL rebake / glTF swap above). Scope: the
+        // main mesh pipeline (mesh.vert + mesh.frag) — the common edit case.
+        if (m_shaderReloadRequested) {
+            m_shaderReloadRequested = false;
+            bool ok =
+                recompileShader(m_shaderSrcDir + "/mesh.vert",
+                                "shaders/mesh.vert.spv") &&
+                recompileShader(m_shaderSrcDir + "/mesh.frag",
+                                "shaders/mesh.frag.spv");
+            if (ok) {
+                vkDeviceWaitIdle(m_vk.device);
+                vkDestroyPipeline(m_vk.device, m_pipeline.graphicsPipeline,
+                                  nullptr);
+                vkDestroyPipelineLayout(m_vk.device, m_pipeline.pipelineLayout,
+                                        nullptr);
+                m_pipeline = createGraphicsPipeline(
+                    m_vk.device, m_offscreen.renderPass, m_offscreen.extent,
+                    m_descriptors.sceneSetLayout,
+                    m_descriptors.materialSetLayout,
+                    "shaders/mesh.vert.spv", "shaders/mesh.frag.spv");
+                std::cout << "[Shaders] mesh pipeline reloaded from "
+                          << m_shaderSrcDir << "\n";
+            } else {
+                std::cerr << "[Shaders] recompile failed — is glslc on PATH "
+                             "or VULKAN_SDK set? Check the console for glslc "
+                             "errors.\n";
+            }
         }
         m_debugUI.endFrame();
 
@@ -676,6 +800,11 @@ void Engine::recreateSwapchain() {
 
 void Engine::cleanup() {
     if (m_vk.device != VK_NULL_HANDLE) vkDeviceWaitIdle(m_vk.device);
+
+    // Physics + audio + scripting are CPU-only; tear them down first.
+    m_scripting.cleanup();
+    m_physics.cleanup();
+    m_audio.cleanup();
 
     m_profiler.shutdown(m_vk.device);
     m_debugUI.cleanup(m_vk.device);

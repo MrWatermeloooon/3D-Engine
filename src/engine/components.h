@@ -99,6 +99,65 @@ struct MaterialComponent {
     float parallaxScale = 0.05f;
 };
 
+// Rigid body driven by the Jolt physics world. Jolt types are intentionally
+// kept out of this header (it is included almost everywhere); the body handle
+// is stored as an opaque uint32 (JPH::BodyID value). PhysicsWorld owns the
+// actual Jolt body and maps it back to the entity via body user data.
+struct RigidBodyComponent {
+    enum class Motion : uint8_t { Static, Dynamic, Kinematic };
+    enum class Shape  : uint8_t { Box, Sphere, Capsule };
+
+    Motion motion = Motion::Dynamic;
+    Shape  shape  = Shape::Box;
+
+    // When true, a Box shape's half-extent is derived from the entity's
+    // TransformComponent.scale (the built-in cube mesh spans 1 unit, so the
+    // half-extent is scale * 0.5). Sphere/Capsule always use the fields below.
+    bool  autoShapeFromScale = true;
+    glm::vec3 halfExtent{0.5f};   // Box
+    float radius     = 0.5f;      // Sphere / Capsule
+    float halfHeight = 0.5f;      // Capsule cylinder half-height
+
+    float mass        = 1.0f;     // ignored for Static
+    float friction    = 0.5f;
+    float restitution = 0.2f;
+
+    // JPH::BodyID value. 0xFFFFFFFF = no body created yet (PhysicsWorld fills
+    // this in on the next syncNewBodies()).
+    uint32_t bodyId = 0xFFFFFFFFu;
+};
+
+// 3D positional sound emitter (OpenAL). Position comes from the entity's
+// TransformComponent. Jolt/OpenAL handles are opaque uint32 (0 = not created
+// yet); AudioEngine fills them on the next update().
+struct AudioSourceComponent {
+    std::string clip;             // .wav path; empty => procedural sine tone
+    float toneHz      = 440.0f;   // used only when `clip` is empty
+    float toneSeconds = 1.0f;
+
+    float gain   = 1.0f;
+    float pitch  = 1.0f;
+    bool  loop   = true;
+    bool  playing = true;         // desired state; engine starts/stops to match
+
+    bool  spatial     = true;     // mono only — OpenAL won't spatialize stereo
+    float refDistance = 2.0f;     // distance at which gain is unattenuated
+    float maxDistance = 40.0f;
+    float rolloff     = 1.0f;
+
+    uint32_t bufferId = 0;        // opaque AL buffer (0 = none)
+    uint32_t sourceId = 0;        // opaque AL source (0 = none)
+};
+
+// Lua behaviour script attached to an entity. `path` is a .lua file defining
+// optional on_start(self) / on_update(self, dt). Runtime state (compiled
+// environment, hot-reload timestamp, error latch) lives in ScriptEngine,
+// keyed by entity — not stored here.
+struct ScriptComponent {
+    std::string path;
+    bool enabled = true;
+};
+
 struct NameComponent {
     std::string name;
 };

@@ -2,6 +2,7 @@
 #include "resource_manager.h"
 
 #include <glm/gtc/matrix_transform.hpp>
+#include <string>
 
 entt::entity Scene::createEntity(const std::string& name) {
     auto entity = m_registry.create();
@@ -41,6 +42,14 @@ void Scene::createDefaultScene(ResourceManager& resources) {
         mat.metallic  = 0.0f;
         mat.roughness = 0.85f;
         m_registry.emplace<MaterialComponent>(e, mat);
+
+        // Static physics collider matching the floor box so dynamic bodies
+        // land on it.
+        RigidBodyComponent rb{};
+        rb.motion = RigidBodyComponent::Motion::Static;
+        rb.shape  = RigidBodyComponent::Shape::Box;
+        rb.autoShapeFromScale = true;
+        m_registry.emplace<RigidBodyComponent>(e, rb);
     }
 
     // Metallic spinning cube
@@ -86,6 +95,37 @@ void Scene::createDefaultScene(ResourceManager& resources) {
         mat.roughness = 0.2f;
         m_registry.emplace<MaterialComponent>(e, mat);
         m_registry.emplace<RotatorComponent>(e, glm::vec3(0, 0, 1), 70.0f);
+    }
+
+    // Physics demo: a tower of dynamic boxes that falls and settles on the
+    // floor. Slight per-box X jitter so the stack topples instead of landing
+    // as a perfect column — makes the simulation visibly obvious.
+    {
+        const glm::vec3 colors[5] = {
+            {0.30f, 0.60f, 0.95f}, {0.95f, 0.55f, 0.25f}, {0.45f, 0.85f, 0.45f},
+            {0.85f, 0.35f, 0.55f}, {0.80f, 0.80f, 0.30f},
+        };
+        for (int i = 0; i < 5; ++i) {
+            auto e = createEntity("Physics Box " + std::to_string(i));
+            auto& t = m_registry.get<TransformComponent>(e);
+            t.position = {4.5f + (i % 2 == 0 ? 0.08f : -0.08f),
+                          1.0f + 1.2f * static_cast<float>(i),
+                          0.0f};
+            t.scale    = {0.5f, 0.5f, 0.5f};
+            m_registry.emplace<MeshComponent>(e, cube);
+            MaterialComponent mat{};
+            mat.texture   = tex;
+            mat.color     = glm::vec4(colors[i], 1.0f);
+            mat.metallic  = 0.0f;
+            mat.roughness = 0.5f;
+            m_registry.emplace<MaterialComponent>(e, mat);
+            RigidBodyComponent rb{};
+            rb.motion = RigidBodyComponent::Motion::Dynamic;
+            rb.shape  = RigidBodyComponent::Shape::Box;
+            rb.autoShapeFromScale = true;
+            rb.mass   = 1.0f;
+            m_registry.emplace<RigidBodyComponent>(e, rb);
+        }
     }
 
     // A warm fill light (subtle — sun should still dominate)
